@@ -1,36 +1,49 @@
 # VRM-Soccer
 
-A production-oriented pipeline for converting soccer tracking data into VBVR-style BEV clips.
+A production-oriented pipeline for converting soccer tracking data into VBVR-style BEV clips with full tactical pitch rendering.
 
-The project ingests tracking data (Metrica CSV pair or SkillCorner JSON), samples 10-second windows, applies coordinate normalization and attack-direction alignment, renders tactical BEV frames, and exports exactly:
+The project ingests tracking data (Metrica CSV pair or SkillCorner JSON), samples 10-second windows, applies coordinate normalization and attack-direction alignment, renders tactical BEV frames on a realistic soccer pitch, and exports exactly:
 
 - `video.mp4`
 - `first_frame.png`
 - `last_frame.png`
 
-## What This Version Supports
+## Features
 
-- Multi-source parsers:
-  - Metrica Sports tracking CSVs (home + away)
-  - SkillCorner tracking JSON
-- Robust coordinate mode detection:
+- **Multi-source parsers**
+  - Metrica Sports tracking CSVs (home + away), including 3-row multiline headers
+  - SkillCorner tracking JSON (frames/tracking/data root keys)
+- **Robust coordinate mode detection** (percentile-based, outlier-tolerant)
   - unit `[0,1]`
   - centered `[-L/2, L/2]`, `[-W/2, W/2]`
   - metric `[0, L]`, `[0, W]`
-- Orientation normalization:
-  - possession-aware direction inference
-  - centroid-drift fallback
-- Deterministic large-scale sampling:
-  - global seed + logical clip index derived child seeds
-  - shard-friendly with `--clip_index_offset`
-- Tactical realism filtering (configurable thresholds)
-- Strict output contract per clip directory (only 3 visual files)
+- **Tactical BEV renderer**
+  - Green pitch with alternating grass stripes
+  - Full FIFA-standard markings: boundary, halfway line, center circle, penalty areas, goal areas, penalty spots, penalty arcs, corner arcs, goals with net fill
+  - Distinct team colors: red (home) vs blue (away), yellow ball
+  - Black outlines on all agents for visibility
+  - 800x520 default resolution (correct pitch aspect ratio)
+- **Orientation normalization**
+  - Possession-aware direction inference
+  - Centroid-drift fallback
+- **Deterministic large-scale sampling**
+  - Global seed + logical clip index → derived child seeds
+  - Shard-friendly with `--clip_index_offset`
+- **Tactical realism filtering** (configurable thresholds)
+  - Ball in-bounds ratio
+  - Attack progress
+  - Support distance / ratio
+  - Defense shape
+  - Majority possession coherence
+- **Strict output contract** per clip directory (only 3 visual files)
 
 ## Install
 
 ```bash
 pip install -r requirements.txt
 ```
+
+Requires Python 3.10+, `opencv-python`, `numpy`, `pandas`.
 
 ## Data
 
@@ -40,16 +53,22 @@ Recommended sources:
 - Metrica sample data: https://github.com/metrica-sports/sample-data
 - SkillCorner open data: https://github.com/SkillCorner/opendata
 
+Clone Metrica sample data into `sample_data/`:
+
+```bash
+git clone https://github.com/metrica-sports/sample-data.git sample_data/metrica_official
+```
+
 ## Quick Start
 
 ### 1) Single clip (Metrica)
 
 ```bash
 python soccer_bev_pipeline.py --mode metrica \
-  --home_csv /path/to/home.csv \
-  --away_csv /path/to/away.csv \
+  --home_csv sample_data/metrica_official/data/Sample_Game_1/Sample_Game_1_RawTrackingData_Home_Team.csv \
+  --away_csv sample_data/metrica_official/data/Sample_Game_1/Sample_Game_1_RawTrackingData_Away_Team.csv \
   --output_root output \
-  --clip_id clip_0001 \
+  --clip_id my_clip \
   --fps 25 \
   --seconds 10 \
   --seed 42
@@ -82,45 +101,87 @@ python soccer_bev_pipeline.py --mode skillcorner \
   --seed 42
 ```
 
-## Core CLI Arguments
+## CLI Arguments
 
-- Input:
-  - `--mode {metrica,skillcorner}`
-  - `--home_csv`, `--away_csv` (Metrica)
-  - `--tracking_json` (SkillCorner)
-- Sampling:
-  - `--num_clips`
-  - `--seed`
-  - `--clip_index_offset`
-  - `--start_frame` (fixed start, only when `num_clips=1`)
-  - `--max_sampling_attempts`
-  - `--allow_duplicate_starts`
-- Clip/video:
-  - `--fps` (default `25`)
-  - `--seconds` (default `10`)
-  - `--width`, `--height`
-- Rendering colors:
-  - `--home_color`, `--away_color`, `--ball_color`
-- Pitch:
-  - `--pitch_length_m`, `--pitch_width_m`
-- Realism filter:
-  - `--disable_realism_filter`
-  - `--min_ball_in_bounds_ratio`
-  - `--min_attack_progress_m`
-  - `--support_distance_m`
-  - `--min_support_ratio`
-  - `--min_defense_ahead_ratio`
-  - `--min_majority_possession_ratio`
+### Input
+| Argument | Description |
+|---|---|
+| `--mode` | `metrica` or `skillcorner` (required) |
+| `--home_csv` | Metrica home team CSV path |
+| `--away_csv` | Metrica away team CSV path |
+| `--tracking_json` | SkillCorner tracking JSON path |
+
+### Sampling
+| Argument | Default | Description |
+|---|---|---|
+| `--num_clips` | `1` | Number of clips to sample |
+| `--seed` | `42` | Global random seed |
+| `--clip_index_offset` | `0` | Starting logical clip index (for sharding) |
+| `--start_frame` | — | Fixed start frame (only when `num_clips=1`) |
+| `--max_sampling_attempts` | `100` | Max retries per clip for realism filter |
+| `--allow_duplicate_starts` | off | Allow same start frame across clips |
+
+### Clip & Video
+| Argument | Default | Description |
+|---|---|---|
+| `--fps` | `25` | Output video frame rate |
+| `--seconds` | `10` | Clip duration |
+| `--width` | `800` | Frame width in pixels |
+| `--height` | `520` | Frame height in pixels |
+| `--pitch_length_m` | `105.0` | Pitch length in meters |
+| `--pitch_width_m` | `68.0` | Pitch width in meters |
+
+### Rendering
+| Argument | Default | Description |
+|---|---|---|
+| `--home_color` | `#E63946` | Home team color (hex) |
+| `--away_color` | `#457B9D` | Away team color (hex) |
+| `--ball_color` | `#F5F500` | Ball color (hex) |
+| `--disable_orientation_normalization` | off | Skip attack-direction alignment |
+
+### Realism Filter
+| Argument | Default | Description |
+|---|---|---|
+| `--disable_realism_filter` | off | Skip all realism checks |
+| `--min_ball_in_bounds_ratio` | `0.98` | Min fraction of frames with ball in bounds |
+| `--min_attack_progress_m` | `3.0` | Min forward progress by attacking team (meters) |
+| `--support_distance_m` | `20.0` | Max distance for attacker "support" check |
+| `--min_support_ratio` | `0.55` | Min ratio of frames with nearby support |
+| `--min_defense_ahead_ratio` | `0.0` | Min ratio of frames with defenders ahead of ball |
+| `--min_majority_possession_ratio` | `0.50` | Min ratio of frames where one team holds possession |
 
 ## Output Layout
 
-For each clip (for example `output/clip_0000123/`):
+```text
+output/clip_0000123/
+├── video.mp4         # 10s BEV video (25fps)
+├── first_frame.png   # First frame snapshot
+└── last_frame.png    # Last frame snapshot
+```
+
+## Architecture
 
 ```text
-clip_0000123/
-├── video.mp4
-├── first_frame.png
-└── last_frame.png
+soccer_bev_pipeline.py
+├── Parsers
+│   ├── DataParser (ABC)          — base class with pivot + interpolation
+│   ├── MetricaParser             — Metrica CSV pairs (incl. multiline headers)
+│   └── SkillCornerParser         — SkillCorner JSON
+├── Coordinate Normalization
+│   ├── _detect_axis_mode()       — percentile-based unit/centered/metric detection
+│   └── normalize_coordinates_inplace()
+├── Orientation
+│   ├── normalize_attack_direction()
+│   └── infer_possession_by_proximity()
+├── Realism Filter
+│   ├── RealismConfig             — configurable thresholds
+│   └── evaluate_clip_realism()   — ball bounds, progress, support, defense shape
+├── Sampling
+│   └── sample_clip_specs()       — deterministic seed-derived clip selection
+├── BEVRenderer
+│   ├── _draw_pitch()             — full FIFA-standard pitch markings
+│   └── render_frames()           — tactical dots on pitch background
+└── export_vbvr_clip()            — video.mp4 + first/last frame PNGs
 ```
 
 ## AWS / 1M Scale Notes
@@ -130,10 +191,6 @@ clip_0000123/
 - Keep `--allow_duplicate_starts` disabled unless you explicitly accept repeated windows.
 - Tune realism thresholds to balance quality vs throughput.
 
-## Main File
-
-- `soccer_bev_pipeline.py`: end-to-end parser + sampler + renderer + exporter CLI.
-
 ## License
 
-See `LICENSE`.
+Apache-2.0. See `LICENSE`.
