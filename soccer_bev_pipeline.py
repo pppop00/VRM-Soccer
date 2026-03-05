@@ -115,11 +115,11 @@ def _detect_axis_mode(values: np.ndarray, dim_m: float, axis_name: str, source_n
     if finite_vals.size == 0:
         raise ValueError(f"{source_name}: no finite values found for axis '{axis_name}'.")
 
-    min_v = float(np.min(finite_vals))
-    max_v = float(np.max(finite_vals))
+    min_v = float(np.percentile(finite_vals, 0.5))
+    max_v = float(np.percentile(finite_vals, 99.5))
 
-    tol_norm = 0.05
-    tol_meter = max(0.5, dim_m * 0.01)
+    tol_norm = 0.12
+    tol_meter = max(1.0, dim_m * 0.02)
 
     if _is_close_range(min_v, max_v, 0.0, 1.0, tol_norm):
         return "unit"
@@ -128,9 +128,12 @@ def _detect_axis_mode(values: np.ndarray, dim_m: float, axis_name: str, source_n
     if _is_close_range(min_v, max_v, 0.0, dim_m, tol_meter):
         return "metric"
 
+    abs_min = float(np.min(finite_vals))
+    abs_max = float(np.max(finite_vals))
     raise ValueError(
         f"{source_name}: unknown coordinate range on axis '{axis_name}' "
-        f"(min={min_v:.4f}, max={max_v:.4f}, expected unit [0,1], centered "
+        f"(p0.5={min_v:.4f}, p99.5={max_v:.4f}, abs_min={abs_min:.4f}, "
+        f"abs_max={abs_max:.4f}, expected unit [0,1], centered "
         f"[-{dim_m/2:.2f},{dim_m/2:.2f}], or metric [0,{dim_m:.2f}])."
     )
 
