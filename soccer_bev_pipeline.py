@@ -22,7 +22,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import cv2
 import numpy as np
@@ -33,6 +33,18 @@ class AgentType(str, Enum):
     HOME = "home"
     AWAY = "away"
     BALL = "ball"
+
+
+CANONICAL_REQUIRED_COLUMNS = ("frame_id", "agent_id", "agent_type", "x", "y")
+CANONICAL_OPTIONAL_COLUMNS = (
+    "period",
+    "timestamp",
+    "team_id",
+    "player_id",
+    "possession_team",
+    "source_dataset",
+    "source_match_id",
+)
 
 
 @dataclass
@@ -73,6 +85,16 @@ class SampledClipSpec:
     realism_report: ClipRealismReport
 
 
+@dataclass
+class CanonicalTrackingSource:
+    long_df: pd.DataFrame
+    source_name: str
+    possession_df: Optional[pd.DataFrame] = None
+    source_dataset: Optional[str] = None
+    source_match_id: Optional[str] = None
+    schema_version: Optional[str] = None
+
+
 def _natural_sort_key(value: str) -> list[Any]:
     chunks = re.split(r"(\d+)", value)
     out: list[Any] = []
@@ -90,9 +112,9 @@ def _normalize_team_label(raw: Any) -> Optional[str]:
     if isinstance(raw, (int, float)):
         return None
     text = str(raw).strip().lower()
-    if text in {"home", "h", "team_home", "home_team"}:
+    if text in {"home", "h", "team_home", "home_team", "home team"}:
         return AgentType.HOME.value
-    if text in {"away", "a", "team_away", "away_team"}:
+    if text in {"away", "a", "team_away", "away_team", "away team"}:
         return AgentType.AWAY.value
     return None
 
@@ -743,7 +765,74 @@ class DataParser(ABC):
         self._loaded = True
 
 
-class MetricaParser(DataParser):
+class BaseTrackingAdapter(ABC):
+    dataset_name = "unknown"
+    source_name = "Unknown"
+
+    def __init__(self, pitch_length_m: float = 105.0, pitch_width_m: float = 68.0) -> None:
+        self.pitch_length_m = float(pitch_length_m)
+        self.pitch_width_m = float(pitch_width_m)
+
+    @classmethod
+    @abstractmethod
+    def required_input_names(cls) -> tuple[str, ...]:
+        ...
+
+    @abstractmethod
+    def load_canonical(self) -> CanonicalTrackingSource:
+        ...
+
+    def _build_canonical_source(
+        self,
+        long_df: pd.DataFrame,
+        source_name: Optional[str] = None,
+        possession_df: Optional[pd.DataFrame] = None,
+        source_match_id: Optional[str] = None,
+        schema_version: Optional[str] = None,
+    ) -> CanonicalTrackingSource:
+        missing = set(CANONICAL_REQUIRED_COLUMNS) - set(long_df.columns)
+        if missing:
+            raise ValueError(
+                f"{source_name or self.source_name}: canonical source is missing required columns: {sorted(missing)}"
+            )
+
+        canonical = long_df.copy()
+        for col in CANONICAL_OPTIONAL_COLUMNS:
+            if col not in canonical.columns:
+                canonical[col] = pd.NA
+
+        if canonical["source_dataset"].isna().all():
+            canonical["source_dataset"] = self.dataset_name
+        if source_match_id is not None and canonical["source_match_id"].isna().all():
+            canonical["source_match_id"] = source_match_id
+
+        clean_possession = possession_df.copy() if possession_df is not None else None
+        if clean_possession is not None and not clean_possession.empty:
+            required = {"frame_id", "possession_team"}
+            missing_pos = required - set(clean_possession.columns)
+            if missing_pos:
+                raise ValueError(
+                    f"{source_name or self.source_name}: possession source is missing columns: {sorted(missing_pos)}"
+                )
+
+        return CanonicalTrackingSource(
+            long_df=canonical,
+            source_name=source_name or self.source_name,
+            possession_df=clean_possession,
+            source_dataset=self.dataset_name,
+            source_match_id=source_match_id,
+            schema_version=schema_version,
+        )
+
+    @staticmethod
+    def _infer_match_id_from_path(path: Path) -> str:
+        return path.parent.name if path.parent.name else path.stem
+
+
+class MetricaAdapter(BaseTrackingAdapter):
+    dataset_name = "metrica"
+    source_name = "Metrica"
+
     def __init__(
         self,
         home_csv_path: str | Path,
@@ -755,7 +844,11 @@ class MetricaParser(DataParser):
         self.home_csv_path = Path(home_csv_path)
         self.away_csv_path = Path(away_csv_path)
 
-    def load(self) -> None:
+    @classmethod
+    def required_input_names(cls) -> tuple[str, ...]:
+        return ("home_csv", "away_csv")
+
+    def load_canonical(self) -> CanonicalTrackingSource:
         home_df = self._read_metrica_csv(self.home_csv_path)
         away_df = self._read_metrica_csv(self.away_csv_path)
 
@@ -764,10 +857,18 @@ class MetricaParser(DataParser):
 
         combined = pd.concat([home_long, away_long], ignore_index=True)
         combined = combined.drop_duplicates(subset=["frame_id", "agent_id"], keep="first")
-
-        possession = pd.concat([home_pos, away_pos], ignore_index=True) if (not home_pos.empty or not away_pos.empty) else None
-
-        self._finalize_long_df(combined, source_name="Metrica", possession_df=possession)
+        possession = (
+            pd.concat([home_pos, away_pos], ignore_index=True)
+            if (not home_pos.empty or not away_pos.empty)
+            else None
+        )
+        source_match_id = self._infer_match_id_from_path(self.home_csv_path)
+        return self._build_canonical_source(
+            combined,
+            source_name=self.source_name,
+            possession_df=possession,
+            source_match_id=source_match_id,
+        )
 
     def _read_metrica_csv(self, path: Path) -> pd.DataFrame:
         if not path.exists():
@@ -787,7 +888,10 @@ class MetricaParser(DataParser):
             try:
                 df = pd.read_csv(path, low_memory=False, **params)
                 if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = ["_".join([str(c) for c in col if str(c) != "nan"]).strip("_") for col in df.columns]
+                    df.columns = [
+                        "_".join([str(c) for c in col if str(c) != "nan"]).strip("_")
+                        for col in df.columns
+                    ]
                 candidates.append(df)
             except Exception:
                 continue
@@ -799,7 +903,9 @@ class MetricaParser(DataParser):
         best_score = -1
         for df in candidates:
             cols = [str(c) for c in df.columns]
-            score = sum(1 for c in cols if re.search(r"(?:^|[_\-\s])x$", c.strip(), flags=re.IGNORECASE))
+            score = sum(
+                1 for c in cols if re.search(r"(?:^|[_\-\s])x$", c.strip(), flags=re.IGNORECASE)
+            )
             if any(c.lower() == "frame" for c in cols):
                 score += 3
             if score > best_score:
@@ -815,10 +921,6 @@ class MetricaParser(DataParser):
 
     @staticmethod
     def _try_read_metrica_multiline_header(path: Path) -> Optional[pd.DataFrame]:
-        """
-        Parse Metrica sample-data files that use 3 header rows:
-        row1 team labels, row2 jersey labels, row3 base field names.
-        """
         try:
             header_rows = pd.read_csv(path, header=None, nrows=3, low_memory=False)
         except Exception:
@@ -827,10 +929,7 @@ class MetricaParser(DataParser):
         if header_rows.shape[0] < 3:
             return None
 
-        row3 = [
-            "" if pd.isna(v) else str(v).strip()
-            for v in header_rows.iloc[2].tolist()
-        ]
+        row3 = ["" if pd.isna(v) else str(v).strip() for v in header_rows.iloc[2].tolist()]
         if "Frame" not in row3 or not any(v.startswith("Player") for v in row3):
             return None
 
@@ -876,11 +975,7 @@ class MetricaParser(DataParser):
         except Exception:
             return None
 
-        drop_cols = [
-            c
-            for c in df.columns
-            if c.startswith("col_") and df[c].isna().all()
-        ]
+        drop_cols = [c for c in df.columns if c.startswith("col_") and df[c].isna().all()]
         if drop_cols:
             df = df.drop(columns=drop_cols)
         return df
@@ -895,6 +990,8 @@ class MetricaParser(DataParser):
         if frame_col is None:
             raise ValueError(f"Metrica ({source}): could not find frame column in CSV.")
 
+        period_col = self._find_named_col(df.columns, {"period"})
+        time_col = self._find_named_col(df.columns, {"time[s]", "time"})
         lower_col_map = {c.lower(): c for c in df.columns}
         pair_map: dict[str, tuple[str, str]] = {}
 
@@ -909,7 +1006,6 @@ class MetricaParser(DataParser):
                 pair_map[base] = (col, lower_col_map[y_candidate.lower()])
                 continue
 
-            # Second y candidate preserving separator style.
             y_candidate2 = re.sub(r"x$", "y", col_clean, flags=re.IGNORECASE)
             if y_candidate2.lower() in lower_col_map:
                 pair_map[base] = (col, lower_col_map[y_candidate2.lower()])
@@ -920,28 +1016,39 @@ class MetricaParser(DataParser):
                 f"Expected columns like '<agent>_x' and '<agent>_y'."
             )
 
-        records: list[dict[str, Any]] = []
+        records: list[pd.DataFrame] = []
+        team_id = team_type.value
+        source_match_id = self._infer_match_id_from_path(self.home_csv_path)
         for base, (x_col, y_col) in pair_map.items():
             base_l = base.lower()
             if "ball" in base_l:
                 agent_id = "ball"
                 agent_type = AgentType.BALL.value
+                player_id = pd.NA
+                obj_team_id = pd.NA
             else:
                 clean_base = re.sub(r"[^a-zA-Z0-9]+", "_", base).strip("_")
-                team_prefix = AgentType.HOME.value if team_type == AgentType.HOME else AgentType.AWAY.value
-                agent_id = f"{team_prefix}_{clean_base}"
+                agent_id = f"{team_id}_{clean_base}"
                 agent_type = team_type.value
+                player_id = clean_base
+                obj_team_id = team_id
 
-            small = pd.DataFrame(
-                {
-                    "frame_id": df[frame_col],
-                    "agent_id": agent_id,
-                    "agent_type": agent_type,
-                    "x": df[x_col],
-                    "y": df[y_col],
-                }
-            )
-            records.append(small)
+            data: dict[str, Any] = {
+                "frame_id": df[frame_col],
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "x": df[x_col],
+                "y": df[y_col],
+                "team_id": obj_team_id,
+                "player_id": player_id,
+                "source_dataset": self.dataset_name,
+                "source_match_id": source_match_id,
+            }
+            if period_col is not None:
+                data["period"] = df[period_col]
+            if time_col is not None:
+                data["timestamp"] = df[time_col]
+            records.append(pd.DataFrame(data))
 
         long_df = pd.concat(records, ignore_index=True)
 
@@ -968,15 +1075,26 @@ class MetricaParser(DataParser):
         return cols[0] if cols else None
 
     @staticmethod
+    def _find_named_col(columns: Iterable[str], names: set[str]) -> Optional[str]:
+        normalized = {name.replace(" ", "").lower() for name in names}
+        for c in columns:
+            if c.replace(" ", "").lower() in normalized:
+                return c
+        return None
+
+    @staticmethod
     def _find_possession_col(columns: Iterable[str]) -> Optional[str]:
         for c in columns:
-            lc = c.lower()
-            if "possession" in lc:
+            if "possession" in c.lower():
                 return c
         return None
 
 
-class SkillCornerParser(DataParser):
+class SkillCornerAdapter(BaseTrackingAdapter):
+    dataset_name = "skillcorner_v1"
+    source_name = "SkillCorner"
+    schema_version = "skillcorner_tracking_v1"
+
     def __init__(
         self,
         tracking_json_path: str | Path,
@@ -986,37 +1104,48 @@ class SkillCornerParser(DataParser):
         super().__init__(pitch_length_m=pitch_length_m, pitch_width_m=pitch_width_m)
         self.tracking_json_path = Path(tracking_json_path)
 
-    def load(self) -> None:
+    @classmethod
+    def required_input_names(cls) -> tuple[str, ...]:
+        return ("tracking_json",)
+
+    def load_canonical(self) -> CanonicalTrackingSource:
         if not self.tracking_json_path.exists():
             raise FileNotFoundError(f"SkillCorner file not found: {self.tracking_json_path}")
 
         with self.tracking_json_path.open("r", encoding="utf-8") as f:
             raw = json.load(f)
 
-        frames = self._extract_frames(raw)
-        team_map = self._build_team_map(raw)
+        detected_version = self._detect_schema_version(raw)
+        if detected_version != self.schema_version:
+            raise ValueError(
+                f"SkillCorner: detected unsupported schema '{detected_version}'. "
+                f"This pipeline currently supports only '{self.schema_version}'."
+            )
+
+        frames = self._extract_frames_v1(raw)
+        team_map = self._build_team_map_v1(raw)
+        source_match_id = self._extract_match_id_v1(raw)
 
         records: list[dict[str, Any]] = []
         possession_records: list[dict[str, Any]] = []
-
         for idx, frame_obj in enumerate(frames):
-            if not isinstance(frame_obj, dict):
-                raise ValueError(f"SkillCorner: frame at index {idx} is not an object.")
-
-            frame_id = self._extract_frame_id(frame_obj, idx)
-            possession_team = self._extract_possession(frame_obj, team_map)
+            frame_id = self._extract_frame_id_v1(frame_obj, idx)
+            timestamp = frame_obj.get("timestamp", frame_obj.get("time"))
+            period = frame_obj.get("period")
+            possession_team = self._extract_possession_v1(frame_obj, team_map)
             if possession_team is not None:
                 possession_records.append({"frame_id": frame_id, "possession_team": possession_team})
 
-            for obj_idx, obj in enumerate(self._extract_objects(frame_obj)):
+            objects = self._extract_objects_v1(frame_obj, frame_id)
+            for obj_idx, obj in enumerate(objects):
                 if not isinstance(obj, dict):
                     raise ValueError(
                         f"SkillCorner: frame={frame_id}, object index {obj_idx} is not an object."
                     )
 
-                agent_type = self._extract_agent_type(obj, team_map)
-                agent_id = self._extract_agent_id(obj, agent_type)
-                x_val, y_val = self._extract_xy(obj, frame_id, obj_idx)
+                agent_type, team_id = self._extract_agent_type_v1(obj, team_map, frame_id, obj_idx)
+                player_id, agent_id = self._extract_agent_id_v1(obj, agent_type, frame_id, obj_idx)
+                x_val, y_val = self._extract_xy_v1(obj, frame_id, obj_idx)
 
                 records.append(
                     {
@@ -1025,86 +1154,105 @@ class SkillCornerParser(DataParser):
                         "agent_type": agent_type.value,
                         "x": x_val,
                         "y": y_val,
+                        "period": period,
+                        "timestamp": timestamp,
+                        "team_id": team_id,
+                        "player_id": player_id,
+                        "source_dataset": self.dataset_name,
+                        "source_match_id": source_match_id,
                     }
                 )
 
         if not records:
             raise ValueError("SkillCorner: no tracking records parsed from JSON.")
 
-        long_df = pd.DataFrame(records)
-        possession_df = pd.DataFrame(possession_records)
-        self._finalize_long_df(long_df, source_name="SkillCorner", possession_df=possession_df)
-
-    def _extract_frames(self, raw: Any) -> list[dict[str, Any]]:
-        if isinstance(raw, list):
-            return raw
-        if not isinstance(raw, dict):
-            raise ValueError("SkillCorner: root JSON must be an object or a list of frames.")
-
-        for key in ("frames", "tracking", "data"):
-            if key in raw and isinstance(raw[key], list):
-                return raw[key]
-
-        raise ValueError(
-            "SkillCorner: could not find frame array. Expected one of keys: "
-            "'frames', 'tracking', or 'data'."
+        return self._build_canonical_source(
+            pd.DataFrame(records),
+            source_name=self.source_name,
+            possession_df=pd.DataFrame(possession_records),
+            source_match_id=source_match_id,
+            schema_version=self.schema_version,
         )
 
-    def _build_team_map(self, raw: Any) -> dict[str, str]:
-        team_map: dict[str, str] = {}
+    def _detect_schema_version(self, raw: Any) -> str:
         if not isinstance(raw, dict):
-            return team_map
+            raise ValueError("SkillCorner: root JSON must be an object for supported schemas.")
+        if isinstance(raw.get("frames"), list) and isinstance(raw.get("teams"), list):
+            return "skillcorner_tracking_v1"
+        if isinstance(raw.get("tracking"), list):
+            return "skillcorner_tracking_v2"
+        raise ValueError(
+            "SkillCorner: unsupported schema. Expected top-level keys 'frames' and 'teams' "
+            "for skillcorner_tracking_v1."
+        )
 
+    @staticmethod
+    def _extract_frames_v1(raw: dict[str, Any]) -> list[dict[str, Any]]:
+        frames = raw.get("frames")
+        if not isinstance(frames, list):
+            raise ValueError("SkillCorner v1: missing required top-level list 'frames'.")
+        return frames
+
+    @staticmethod
+    def _extract_match_id_v1(raw: dict[str, Any]) -> Optional[str]:
+        for key in ("match_id", "game_id", "id"):
+            if key in raw and raw[key] is not None:
+                return str(raw[key])
+        metadata = raw.get("metadata")
+        if isinstance(metadata, dict):
+            for key in ("match_id", "game_id", "id"):
+                if key in metadata and metadata[key] is not None:
+                    return str(metadata[key])
+        return None
+
+    def _build_team_map_v1(self, raw: dict[str, Any]) -> dict[str, str]:
         teams_obj = raw.get("teams")
-        if isinstance(teams_obj, list):
-            for t in teams_obj:
-                if not isinstance(t, dict):
-                    continue
-                role = None
-                for k in ("role", "side", "type", "name"):
-                    if k in t:
-                        role = _normalize_team_label(t[k])
-                        if role:
-                            break
-                tid = t.get("id") or t.get("team_id")
-                if tid is not None and role is not None:
-                    team_map[str(tid)] = role
-                    team_map[str(tid).lower()] = role
+        if not isinstance(teams_obj, list) or not teams_obj:
+            raise ValueError("SkillCorner v1: missing required top-level team list 'teams'.")
+
+        team_map: dict[str, str] = {}
+        for idx, t in enumerate(teams_obj):
+            if not isinstance(t, dict):
+                raise ValueError(f"SkillCorner v1: teams[{idx}] must be an object.")
+            role = None
+            for key in ("role", "side", "type", "name"):
+                if key in t:
+                    role = _normalize_team_label(t[key])
+                    if role is not None:
+                        break
+            team_id = t.get("id", t.get("team_id"))
+            if team_id is None or role is None:
+                raise ValueError(
+                    f"SkillCorner v1: teams[{idx}] must include an id/team_id and a home/away role."
+                )
+            team_map[str(team_id)] = role
+            team_map[str(team_id).lower()] = role
         return team_map
 
     @staticmethod
-    def _extract_frame_id(frame_obj: dict[str, Any], frame_index: int) -> int:
-        for key in ("frame_id", "frame", "id"):
+    def _extract_frame_id_v1(frame_obj: dict[str, Any], frame_index: int) -> int:
+        for key in ("frame_id", "id"):
             if key in frame_obj:
                 try:
                     return int(frame_obj[key])
                 except Exception as exc:
                     raise ValueError(
-                        f"SkillCorner: invalid frame id in key '{key}' at index {frame_index}: {frame_obj[key]}"
+                        f"SkillCorner v1: invalid frame id in key '{key}' at index {frame_index}: {frame_obj[key]}"
                     ) from exc
-        raise ValueError(f"SkillCorner: missing frame id at frame index {frame_index}.")
+        raise ValueError(f"SkillCorner v1: missing frame_id at frame index {frame_index}.")
 
     @staticmethod
-    def _extract_objects(frame_obj: dict[str, Any]) -> list[dict[str, Any]]:
-        for key in ("objects", "players", "tracks", "data"):
-            val = frame_obj.get(key)
-            if isinstance(val, list):
-                return val
-
-        # Fallback shape where objects can be in dicts keyed by id.
-        for key in ("objects", "players"):
-            val = frame_obj.get(key)
-            if isinstance(val, dict):
-                return [v for v in val.values() if isinstance(v, dict)]
-
-        raise ValueError(
-            "SkillCorner: missing tracking objects list in frame. "
-            "Expected one of keys: 'objects', 'players', 'tracks', or 'data'."
-        )
+    def _extract_objects_v1(frame_obj: dict[str, Any], frame_id: int) -> list[dict[str, Any]]:
+        objects = frame_obj.get("objects")
+        if not isinstance(objects, list):
+            raise ValueError(
+                f"SkillCorner v1: frame={frame_id} must contain an 'objects' list."
+            )
+        return objects
 
     @staticmethod
-    def _extract_possession(frame_obj: dict[str, Any], team_map: dict[str, str]) -> Optional[str]:
-        for key in ("possession_team", "possession", "team_in_possession"):
+    def _extract_possession_v1(frame_obj: dict[str, Any], team_map: dict[str, str]) -> Optional[str]:
+        for key in ("possession_team", "team_in_possession"):
             if key not in frame_obj:
                 continue
             raw = frame_obj[key]
@@ -1113,79 +1261,378 @@ class SkillCornerParser(DataParser):
             mapped = _normalize_team_label(raw)
             if mapped is not None:
                 return mapped
-            if str(raw) in team_map:
-                return team_map[str(raw)]
-            if str(raw).lower() in team_map:
-                return team_map[str(raw).lower()]
+            raw_str = str(raw)
+            if raw_str in team_map:
+                return team_map[raw_str]
+            if raw_str.lower() in team_map:
+                return team_map[raw_str.lower()]
         return None
 
     @staticmethod
-    def _extract_agent_type(obj: dict[str, Any], team_map: dict[str, str]) -> AgentType:
-        is_ball = obj.get("is_ball")
-        if isinstance(is_ball, bool) and is_ball:
-            return AgentType.BALL
+    def _extract_agent_type_v1(
+        obj: dict[str, Any],
+        team_map: dict[str, str],
+        frame_id: int,
+        obj_idx: int,
+    ) -> tuple[AgentType, Any]:
+        if obj.get("is_ball") is True:
+            return AgentType.BALL, pd.NA
 
-        for k in ("type", "object_type", "role"):
-            if k in obj and isinstance(obj[k], str) and "ball" in obj[k].lower():
-                return AgentType.BALL
+        obj_type = obj.get("object_type", obj.get("type"))
+        if isinstance(obj_type, str) and "ball" in obj_type.lower():
+            return AgentType.BALL, pd.NA
 
-        team_candidates = [
-            obj.get("team"),
-            obj.get("team_id"),
-            obj.get("side"),
-            obj.get("team_name"),
-        ]
-        for cand in team_candidates:
-            mapped = _normalize_team_label(cand)
+        for key in ("team_id", "team", "team_name"):
+            if key not in obj or obj[key] is None:
+                continue
+            raw_team = obj[key]
+            mapped = _normalize_team_label(raw_team)
             if mapped is not None:
-                return AgentType(mapped)
-            if cand is not None:
-                if str(cand) in team_map:
-                    return AgentType(team_map[str(cand)])
-                if str(cand).lower() in team_map:
-                    return AgentType(team_map[str(cand).lower()])
+                return AgentType(mapped), raw_team
+            raw_team_str = str(raw_team)
+            if raw_team_str in team_map:
+                return AgentType(team_map[raw_team_str]), raw_team
+            if raw_team_str.lower() in team_map:
+                return AgentType(team_map[raw_team_str.lower()]), raw_team
 
         raise ValueError(
-            "SkillCorner: unable to classify non-ball object as home/away. "
-            "Missing or unknown team identifier fields."
+            f"SkillCorner v1: frame={frame_id}, object_index={obj_idx} missing a valid team identifier."
         )
 
     @staticmethod
-    def _extract_agent_id(obj: dict[str, Any], agent_type: AgentType) -> str:
+    def _extract_agent_id_v1(
+        obj: dict[str, Any],
+        agent_type: AgentType,
+        frame_id: int,
+        obj_idx: int,
+    ) -> tuple[Any, str]:
         if agent_type == AgentType.BALL:
-            return "ball"
+            return pd.NA, "ball"
 
-        for key in ("player_id", "track_id", "id", "object_id"):
+        for key in ("player_id", "track_id", "object_id", "id"):
             if key in obj and obj[key] is not None:
                 raw = str(obj[key]).strip()
                 if raw:
-                    return f"{agent_type.value}_{raw}"
+                    return raw, f"{agent_type.value}_{raw}"
 
         raise ValueError(
-            f"SkillCorner: missing player identifier for {agent_type.value} object."
+            f"SkillCorner v1: frame={frame_id}, object_index={obj_idx} missing player identifier."
         )
 
     @staticmethod
-    def _extract_xy(obj: dict[str, Any], frame_id: int, obj_idx: int) -> tuple[float, float]:
+    def _extract_xy_v1(obj: dict[str, Any], frame_id: int, obj_idx: int) -> tuple[float, float]:
         if "x" in obj and "y" in obj:
             return float(obj["x"]), float(obj["y"])
 
-        if "position" in obj:
-            pos = obj["position"]
-            if isinstance(pos, dict) and "x" in pos and "y" in pos:
-                return float(pos["x"]), float(pos["y"])
-            if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                return float(pos[0]), float(pos[1])
+        position = obj.get("position")
+        if isinstance(position, dict) and "x" in position and "y" in position:
+            return float(position["x"]), float(position["y"])
+        if isinstance(position, (list, tuple)) and len(position) >= 2:
+            return float(position[0]), float(position[1])
 
-        if "coordinates" in obj:
-            coords = obj["coordinates"]
-            if isinstance(coords, dict) and "x" in coords and "y" in coords:
-                return float(coords["x"]), float(coords["y"])
-            if isinstance(coords, (list, tuple)) and len(coords) >= 2:
-                return float(coords[0]), float(coords[1])
+        coordinates = obj.get("coordinates")
+        if isinstance(coordinates, dict) and "x" in coordinates and "y" in coordinates:
+            return float(coordinates["x"]), float(coordinates["y"])
+        if isinstance(coordinates, (list, tuple)) and len(coordinates) >= 2:
+            return float(coordinates[0]), float(coordinates[1])
 
         raise ValueError(
-            f"SkillCorner: missing x/y coordinates at frame={frame_id}, object_index={obj_idx}."
+            f"SkillCorner v1: frame={frame_id}, object_index={obj_idx} missing x/y coordinates."
+        )
+
+
+class SkillCornerV2Adapter(BaseTrackingAdapter):
+    dataset_name = "skillcorner_v2"
+    source_name = "SkillCorner"
+    schema_version = "skillcorner_tracking_v2"
+
+    def __init__(
+        self,
+        tracking_json_path: str | Path,
+        match_json_path: str | Path | None = None,
+        pitch_length_m: float = 105.0,
+        pitch_width_m: float = 68.0,
+    ) -> None:
+        super().__init__(pitch_length_m=pitch_length_m, pitch_width_m=pitch_width_m)
+        self.tracking_json_path = Path(tracking_json_path)
+        self.match_json_path = Path(match_json_path) if match_json_path is not None else None
+
+    @classmethod
+    def required_input_names(cls) -> tuple[str, ...]:
+        return ("tracking_json",)
+
+    def load_canonical(self) -> CanonicalTrackingSource:
+        if not self.tracking_json_path.exists():
+            raise FileNotFoundError(f"SkillCorner file not found: {self.tracking_json_path}")
+        match_path = self._resolve_match_json_path()
+        if not match_path.exists():
+            raise FileNotFoundError(
+                f"SkillCorner v2: required companion match file not found: {match_path}"
+            )
+
+        with match_path.open("r", encoding="utf-8") as f:
+            match_obj = json.load(f)
+
+        team_role_by_team_id, player_team_by_player_id = self._build_match_maps_v2(match_obj)
+        source_match_id = self._extract_match_id_v2(match_obj, match_path)
+
+        records: list[dict[str, Any]] = []
+        possession_records: list[dict[str, Any]] = []
+        with self.tracking_json_path.open("r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    frame_obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"SkillCorner v2: invalid JSONL at line {line_idx} in {self.tracking_json_path}."
+                    ) from exc
+
+                frame_id = self._extract_frame_id_v2(frame_obj, line_idx)
+                timestamp = frame_obj.get("timestamp")
+                period = frame_obj.get("period")
+
+                possession_team = self._extract_possession_v2(
+                    frame_obj, player_team_by_player_id, team_role_by_team_id
+                )
+                if possession_team is not None:
+                    possession_records.append({"frame_id": frame_id, "possession_team": possession_team})
+
+                ball_data = frame_obj.get("ball_data")
+                if isinstance(ball_data, dict):
+                    bx, by = ball_data.get("x"), ball_data.get("y")
+                    if bx is not None and by is not None:
+                        records.append(
+                            {
+                                "frame_id": frame_id,
+                                "agent_id": "ball",
+                                "agent_type": AgentType.BALL.value,
+                                "x": bx,
+                                "y": by,
+                                "period": period,
+                                "timestamp": timestamp,
+                                "team_id": pd.NA,
+                                "player_id": pd.NA,
+                                "source_dataset": self.dataset_name,
+                                "source_match_id": source_match_id,
+                            }
+                        )
+
+                player_data = frame_obj.get("player_data")
+                if player_data is None:
+                    raise ValueError(f"SkillCorner v2: frame={frame_id} missing required 'player_data' list.")
+                if not isinstance(player_data, list):
+                    raise ValueError(f"SkillCorner v2: frame={frame_id} field 'player_data' must be a list.")
+
+                for obj_idx, obj in enumerate(player_data):
+                    if not isinstance(obj, dict):
+                        raise ValueError(
+                            f"SkillCorner v2: frame={frame_id}, player_data[{obj_idx}] must be an object."
+                        )
+                    player_id = obj.get("player_id")
+                    if player_id is None:
+                        raise ValueError(
+                            f"SkillCorner v2: frame={frame_id}, player_data[{obj_idx}] missing player_id."
+                        )
+                    if player_id not in player_team_by_player_id:
+                        raise ValueError(
+                            f"SkillCorner v2: frame={frame_id}, player_id={player_id} not found in companion match metadata."
+                        )
+                    team_id = player_team_by_player_id[player_id]
+                    team_role = team_role_by_team_id.get(team_id)
+                    if team_role is None:
+                        raise ValueError(
+                            f"SkillCorner v2: frame={frame_id}, player_id={player_id} has unknown team_id={team_id}."
+                        )
+                    x_val, y_val = self._extract_xy_v2(obj, frame_id, obj_idx)
+                    records.append(
+                        {
+                            "frame_id": frame_id,
+                            "agent_id": f"{team_role}_{player_id}",
+                            "agent_type": team_role,
+                            "x": x_val,
+                            "y": y_val,
+                            "period": period,
+                            "timestamp": timestamp,
+                            "team_id": team_id,
+                            "player_id": player_id,
+                            "source_dataset": self.dataset_name,
+                            "source_match_id": source_match_id,
+                        }
+                    )
+
+        if not records:
+            raise ValueError("SkillCorner v2: no tracking records parsed from JSONL.")
+
+        return self._build_canonical_source(
+            pd.DataFrame(records),
+            source_name=self.source_name,
+            possession_df=pd.DataFrame(possession_records),
+            source_match_id=source_match_id,
+            schema_version=self.schema_version,
+        )
+
+    def _resolve_match_json_path(self) -> Path:
+        if self.match_json_path is not None:
+            return self.match_json_path
+        filename = self.tracking_json_path.name
+        if filename.endswith("_tracking_extrapolated.jsonl"):
+            return self.tracking_json_path.with_name(
+                filename.replace("_tracking_extrapolated.jsonl", "_match.json")
+            )
+        return self.tracking_json_path.with_suffix(".match.json")
+
+    @staticmethod
+    def _build_match_maps_v2(match_obj: dict[str, Any]) -> tuple[dict[Any, str], dict[Any, Any]]:
+        if not isinstance(match_obj, dict):
+            raise ValueError("SkillCorner v2: companion match file must be a JSON object.")
+
+        home_team = match_obj.get("home_team")
+        away_team = match_obj.get("away_team")
+        if not isinstance(home_team, dict) or not isinstance(away_team, dict):
+            raise ValueError("SkillCorner v2: companion match file must include home_team and away_team objects.")
+
+        team_role_by_team_id = {
+            home_team.get("id"): AgentType.HOME.value,
+            away_team.get("id"): AgentType.AWAY.value,
+        }
+        if None in team_role_by_team_id:
+            raise ValueError("SkillCorner v2: companion match file must include home_team.id and away_team.id.")
+
+        players = match_obj.get("players")
+        if not isinstance(players, list):
+            raise ValueError("SkillCorner v2: companion match file must include a players list.")
+
+        player_team_by_player_id: dict[Any, Any] = {}
+        for idx, player in enumerate(players):
+            if not isinstance(player, dict):
+                raise ValueError(f"SkillCorner v2: players[{idx}] must be an object.")
+            player_id = player.get("id")
+            team_id = player.get("team_id")
+            if player_id is None or team_id is None:
+                continue
+            player_team_by_player_id[player_id] = team_id
+
+        if not player_team_by_player_id:
+            raise ValueError("SkillCorner v2: companion match file contains no usable player/team mappings.")
+        return team_role_by_team_id, player_team_by_player_id
+
+    @staticmethod
+    def _extract_match_id_v2(match_obj: dict[str, Any], match_path: Path) -> str:
+        if match_obj.get("id") is not None:
+            return str(match_obj["id"])
+        return match_path.parent.name if match_path.parent.name else match_path.stem
+
+    @staticmethod
+    def _extract_frame_id_v2(frame_obj: dict[str, Any], line_idx: int) -> int:
+        if "frame" not in frame_obj:
+            raise ValueError(f"SkillCorner v2: line {line_idx} missing required key 'frame'.")
+        try:
+            return int(frame_obj["frame"])
+        except Exception as exc:
+            raise ValueError(
+                f"SkillCorner v2: invalid frame value at line {line_idx}: {frame_obj['frame']}"
+            ) from exc
+
+    @staticmethod
+    def _extract_possession_v2(
+        frame_obj: dict[str, Any],
+        player_team_by_player_id: dict[Any, Any],
+        team_role_by_team_id: dict[Any, str],
+    ) -> Optional[str]:
+        possession = frame_obj.get("possession")
+        if not isinstance(possession, dict):
+            return None
+
+        mapped = _normalize_team_label(possession.get("group"))
+        if mapped is not None:
+            return mapped
+
+        player_id = possession.get("player_id")
+        if player_id in player_team_by_player_id:
+            return team_role_by_team_id.get(player_team_by_player_id[player_id])
+        return None
+
+    @staticmethod
+    def _extract_xy_v2(obj: dict[str, Any], frame_id: int, obj_idx: int) -> tuple[float, float]:
+        if "x" not in obj or "y" not in obj:
+            raise ValueError(
+                f"SkillCorner v2: frame={frame_id}, player_data[{obj_idx}] missing x/y coordinates."
+            )
+        return float(obj["x"]), float(obj["y"])
+
+
+class AdapterBackedParser(DataParser):
+    def __init__(self, adapter: BaseTrackingAdapter) -> None:
+        super().__init__(pitch_length_m=adapter.pitch_length_m, pitch_width_m=adapter.pitch_width_m)
+        self.adapter = adapter
+        self._source_dataset: Optional[str] = None
+        self._source_match_id: Optional[str] = None
+        self._schema_version: Optional[str] = None
+
+    def load(self) -> None:
+        canonical = self.adapter.load_canonical()
+        self._source_dataset = canonical.source_dataset
+        self._source_match_id = canonical.source_match_id
+        self._schema_version = canonical.schema_version
+        self._finalize_long_df(
+            canonical.long_df,
+            source_name=canonical.source_name,
+            possession_df=canonical.possession_df,
+        )
+
+
+class MetricaParser(AdapterBackedParser):
+    def __init__(
+        self,
+        home_csv_path: str | Path,
+        away_csv_path: str | Path,
+        pitch_length_m: float = 105.0,
+        pitch_width_m: float = 68.0,
+    ) -> None:
+        super().__init__(
+            MetricaAdapter(
+                home_csv_path=home_csv_path,
+                away_csv_path=away_csv_path,
+                pitch_length_m=pitch_length_m,
+                pitch_width_m=pitch_width_m,
+            )
+        )
+
+
+class SkillCornerParser(AdapterBackedParser):
+    def __init__(
+        self,
+        tracking_json_path: str | Path,
+        pitch_length_m: float = 105.0,
+        pitch_width_m: float = 68.0,
+    ) -> None:
+        super().__init__(
+            SkillCornerAdapter(
+                tracking_json_path=tracking_json_path,
+                pitch_length_m=pitch_length_m,
+                pitch_width_m=pitch_width_m,
+            )
+        )
+
+
+class SkillCornerV2Parser(AdapterBackedParser):
+    def __init__(
+        self,
+        tracking_json_path: str | Path,
+        match_json_path: str | Path | None = None,
+        pitch_length_m: float = 105.0,
+        pitch_width_m: float = 68.0,
+    ) -> None:
+        super().__init__(
+            SkillCornerV2Adapter(
+                tracking_json_path=tracking_json_path,
+                match_json_path=match_json_path,
+                pitch_length_m=pitch_length_m,
+                pitch_width_m=pitch_width_m,
+            )
         )
 
 
@@ -1501,15 +1948,117 @@ def sample_clip_specs(
     return sampled
 
 
+@dataclass(frozen=True)
+class DatasetRegistration:
+    name: str
+    parser_factory: Callable[[argparse.Namespace], DataParser]
+    required_args: tuple[str, ...]
+
+
+DATASET_ALIASES = {
+    "skillcorner": "skillcorner_v2",
+}
+
+
+def _build_metrica_parser(args: argparse.Namespace) -> DataParser:
+    return MetricaParser(
+        home_csv_path=args.home_csv,
+        away_csv_path=args.away_csv,
+        pitch_length_m=args.pitch_length_m,
+        pitch_width_m=args.pitch_width_m,
+    )
+
+
+def _build_skillcorner_v1_parser(args: argparse.Namespace) -> DataParser:
+    return SkillCornerParser(
+        tracking_json_path=args.tracking_json,
+        pitch_length_m=args.pitch_length_m,
+        pitch_width_m=args.pitch_width_m,
+    )
+
+
+def _build_skillcorner_v2_parser(args: argparse.Namespace) -> DataParser:
+    return SkillCornerV2Parser(
+        tracking_json_path=args.tracking_json,
+        match_json_path=args.match_json,
+        pitch_length_m=args.pitch_length_m,
+        pitch_width_m=args.pitch_width_m,
+    )
+
+
+DATASET_REGISTRY: dict[str, DatasetRegistration] = {
+    "metrica": DatasetRegistration(
+        name="metrica",
+        parser_factory=_build_metrica_parser,
+        required_args=MetricaAdapter.required_input_names(),
+    ),
+    "skillcorner_v1": DatasetRegistration(
+        name="skillcorner_v1",
+        parser_factory=_build_skillcorner_v1_parser,
+        required_args=SkillCornerAdapter.required_input_names(),
+    ),
+    "skillcorner_v2": DatasetRegistration(
+        name="skillcorner_v2",
+        parser_factory=_build_skillcorner_v2_parser,
+        required_args=SkillCornerV2Adapter.required_input_names(),
+    ),
+}
+
+
+def _create_dataset_parser(dataset_name: str, args: argparse.Namespace) -> DataParser:
+    dataset = DATASET_ALIASES.get(dataset_name, dataset_name)
+    registration = DATASET_REGISTRY.get(dataset)
+    if registration is None:
+        supported = ", ".join(sorted(DATASET_REGISTRY))
+        raise ValueError(f"Unknown dataset '{dataset_name}'. Supported datasets: {supported}.")
+
+    missing: list[str] = []
+    for arg_name in registration.required_args:
+        if not getattr(args, arg_name, None):
+            missing.append(f"--{arg_name}")
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(f"--dataset {dataset} requires {missing_text}.")
+
+    return registration.parser_factory(args)
+
+
+def _resolve_dataset_name(args: argparse.Namespace) -> str:
+    if args.dataset:
+        return str(args.dataset).strip().lower()
+    if args.mode:
+        legacy = str(args.mode).strip().lower()
+        return DATASET_ALIASES.get(legacy, legacy)
+    supported = ", ".join(sorted(DATASET_REGISTRY))
+    raise ValueError(f"Missing dataset selection. Use --dataset {{{supported}}}.")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Parse soccer tracking data and export VBVR-style BEV clip artifacts."
     )
 
-    parser.add_argument("--mode", choices=["metrica", "skillcorner"], required=True)
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help=f"Dataset adapter name. Supported: {', '.join(sorted(DATASET_REGISTRY))}.",
+    )
+    parser.add_argument("--mode", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--home_csv", type=str, default=None, help="Metrica home CSV path.")
     parser.add_argument("--away_csv", type=str, default=None, help="Metrica away CSV path.")
-    parser.add_argument("--tracking_json", type=str, default=None, help="SkillCorner tracking JSON path.")
+    parser.add_argument(
+        "--tracking_json",
+        type=str,
+        default=None,
+        help="SkillCorner tracking path. JSON for v1, JSONL for official open-data v2.",
+    )
+    parser.add_argument(
+        "--match_json",
+        type=str,
+        default=None,
+        help="Optional SkillCorner companion match metadata JSON path for v2. If omitted, inferred from the tracking file name.",
+    )
 
     parser.add_argument("--output_root", type=str, default="output")
     parser.add_argument("--clip_id", type=str, default="soccer_bev_00000000")
@@ -1545,30 +2094,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    dataset_name = _resolve_dataset_name(args)
     clip_frames = int(args.fps * args.seconds)
     if clip_frames <= 0:
         raise ValueError("fps * seconds must be > 0.")
     if args.max_sampling_attempts <= 0:
         raise ValueError("--max_sampling_attempts must be > 0.")
 
-    if args.mode == "metrica":
-        if not args.home_csv or not args.away_csv:
-            raise ValueError("--mode metrica requires both --home_csv and --away_csv.")
-        data_parser: DataParser = MetricaParser(
-            home_csv_path=args.home_csv,
-            away_csv_path=args.away_csv,
-            pitch_length_m=args.pitch_length_m,
-            pitch_width_m=args.pitch_width_m,
-        )
-    else:
-        if not args.tracking_json:
-            raise ValueError("--mode skillcorner requires --tracking_json.")
-        data_parser = SkillCornerParser(
-            tracking_json_path=args.tracking_json,
-            pitch_length_m=args.pitch_length_m,
-            pitch_width_m=args.pitch_width_m,
-        )
-
+    data_parser = _create_dataset_parser(dataset_name, args)
     data_parser.load()
     realism_config = RealismConfig(
         enabled=not args.disable_realism_filter,
@@ -1619,7 +2152,7 @@ def main() -> None:
         export_prompt_txt(prompt_text, out_dir)
 
         print(
-            f"[{idx + 1}/{len(sampled_specs)}] Export complete: mode={args.mode}, "
+            f"[{idx + 1}/{len(sampled_specs)}] Export complete: dataset={dataset_name}, "
             f"clip_id={clip_id}, start_frame={spec.start_frame}, clip_seed={spec.seed}, "
             f"frames={clip_frames}, agents={len(clip.agent_ids)}, output={out_dir}, "
             f"realism_passed={spec.realism_report.passed}, "

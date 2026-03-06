@@ -2,7 +2,7 @@
 
 A production-oriented pipeline for converting soccer tracking data into VBVR-style BEV clips with full tactical pitch rendering.
 
-The project ingests tracking data (Metrica CSV pair or SkillCorner JSON), samples 10-second windows, applies coordinate normalization and attack-direction alignment, renders tactical BEV frames on a realistic soccer pitch, and exports per clip:
+The project ingests tracking data through dataset adapters, samples 10-second windows, applies coordinate normalization and attack-direction alignment, renders tactical BEV frames on a realistic soccer pitch, and exports per clip:
 
 - `ground_truth.mp4`
 - `first_frame.png`
@@ -13,9 +13,14 @@ Output naming follows the [VBVR-DataFactory](https://github.com/Video-Reason/VBV
 
 ## Features
 
-- **Multi-source parsers**
-  - Metrica Sports tracking CSVs (home + away), including 3-row multiline headers
-  - SkillCorner tracking JSON (frames/tracking/data root keys)
+- **Canonical multi-source adapter layer**
+  - `MetricaAdapter` for Metrica Sports tracking CSV pairs
+  - `SkillCornerAdapter` for strict `skillcorner_tracking_v1` JSON
+  - `SkillCornerV2Adapter` for official SkillCorner Open Data (`*_tracking_extrapolated.jsonl` + `*_match.json`)
+  - Shared parser stage for densification, interpolation, normalization, and clip extraction
+- **Canonical ingestion contract**
+  - Required columns: `frame_id`, `agent_id`, `agent_type`, `x`, `y`
+  - Optional columns: `period`, `timestamp`, `team_id`, `player_id`, `possession_team`, `source_dataset`, `source_match_id`
 - **Robust coordinate mode detection** (percentile-based, outlier-tolerant)
   - unit `[0,1]`
   - centered `[-L/2, L/2]`, `[-W/2, W/2]`
@@ -56,6 +61,8 @@ Recommended sources:
 - Metrica sample data: https://github.com/metrica-sports/sample-data
 - SkillCorner open data: https://github.com/SkillCorner/opendata
 
+Raw datasets are treated as immutable inputs. Dataset-specific cleanup should happen only in canonicalized cache artifacts, not by rewriting source files.
+
 Clone Metrica sample data into `sample_data/`:
 
 ```bash
@@ -67,7 +74,7 @@ git clone https://github.com/metrica-sports/sample-data.git sample_data/metrica_
 ### 1) Single clip (Metrica)
 
 ```bash
-python soccer_bev_pipeline.py --mode metrica \
+python soccer_bev_pipeline.py --dataset metrica \
   --home_csv sample_data/metrica_official/data/Sample_Game_1/Sample_Game_1_RawTrackingData_Home_Team.csv \
   --away_csv sample_data/metrica_official/data/Sample_Game_1/Sample_Game_1_RawTrackingData_Away_Team.csv \
   --output_root output \
@@ -80,7 +87,7 @@ python soccer_bev_pipeline.py --mode metrica \
 ### 2) Batch generation (deterministic)
 
 ```bash
-python soccer_bev_pipeline.py --mode metrica \
+python soccer_bev_pipeline.py --dataset metrica \
   --home_csv /path/to/home.csv \
   --away_csv /path/to/away.csv \
   --output_root output \
@@ -92,27 +99,31 @@ python soccer_bev_pipeline.py --mode metrica \
   --seed 2026
 ```
 
-### 3) SkillCorner mode
+### 3) SkillCorner Open Data (`skillcorner_v2`)
 
 ```bash
-python soccer_bev_pipeline.py --mode skillcorner \
-  --tracking_json /path/to/tracking.json \
+python soccer_bev_pipeline.py --dataset skillcorner_v2 \
+  --tracking_json sample_data/skillcorner_opendata/data/matches/1886347/1886347_tracking_extrapolated.jsonl \
+  --match_json sample_data/skillcorner_opendata/data/matches/1886347/1886347_match.json \
   --output_root output \
   --clip_id soccer_bev_00000000 \
-  --fps 25 \
+  --fps 10 \
   --seconds 10 \
   --seed 42
 ```
+
+Legacy `--mode` is still accepted as a compatibility alias, but new usage should prefer `--dataset`.
 
 ## CLI Arguments
 
 ### Input
 | Argument | Description |
 |---|---|
-| `--mode` | `metrica` or `skillcorner` (required) |
+| `--dataset` | `metrica`, `skillcorner_v1`, or `skillcorner_v2` |
 | `--home_csv` | Metrica home team CSV path |
 | `--away_csv` | Metrica away team CSV path |
-| `--tracking_json` | SkillCorner tracking JSON path |
+| `--tracking_json` | SkillCorner tracking path: JSON for v1, JSONL for official v2 |
+| `--match_json` | Optional SkillCorner companion match metadata JSON path for v2 |
 
 ### Sampling
 | Argument | Default | Description |
@@ -178,10 +189,17 @@ Instance folders use 8-digit zero-padded indices (`_00000000`, `_00000001`, ...)
 
 ```text
 soccer_bev_pipeline.py
-├── Parsers
-│   ├── DataParser (ABC)          — base class with pivot + interpolation
-│   ├── MetricaParser             — Metrica CSV pairs (incl. multiline headers)
-│   └── SkillCornerParser         — SkillCorner JSON
+├── Canonical Adapters
+│   ├── BaseTrackingAdapter       — dataset-specific raw -> canonical long-form mapping
+│   ├── MetricaAdapter            — Metrica CSV pairs (incl. multiline headers)
+│   ├── SkillCornerAdapter        — strict skillcorner_tracking_v1 JSON
+│   └── SkillCornerV2Adapter      — official SkillCorner Open Data JSONL + match metadata
+├── Shared Parser
+│   ├── DataParser (ABC)          — shared pivot + interpolation contract
+│   ├── AdapterBackedParser       — shared canonical parser implementation
+│   ├── MetricaParser             — thin wrapper over MetricaAdapter
+│   ├── SkillCornerParser         — thin wrapper over SkillCornerAdapter
+│   └── SkillCornerV2Parser       — thin wrapper over SkillCornerV2Adapter
 ├── Coordinate Normalization
 │   ├── _detect_axis_mode()       — percentile-based unit/centered/metric detection
 │   └── normalize_coordinates_inplace()
@@ -199,7 +217,18 @@ soccer_bev_pipeline.py
 ├── Prompt Generator
 │   ├── analyze_clip_events()     — possession, passes, ball movement from tracking
 │   └── generate_clip_prompt()    — English tactical description
+├── Dataset Registry
+│   ├── _resolve_dataset_name()   — dataset / legacy mode resolution
+│   └── _create_dataset_parser()  — adapter-backed parser factory
+├── Tests
+│   └── tests/test_adapters.py    — adapter contract and canonicalization regression tests
 └── export_vbvr_clip()            — ground_truth.mp4 + first/final frame PNGs + prompt.txt
+```
+
+## Testing
+
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ## AWS / 1M Scale Notes
