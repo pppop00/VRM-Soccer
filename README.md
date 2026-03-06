@@ -2,11 +2,14 @@
 
 A production-oriented pipeline for converting soccer tracking data into VBVR-style BEV clips with full tactical pitch rendering.
 
-The project ingests tracking data (Metrica CSV pair or SkillCorner JSON), samples 10-second windows, applies coordinate normalization and attack-direction alignment, renders tactical BEV frames on a realistic soccer pitch, and exports exactly:
+The project ingests tracking data (Metrica CSV pair or SkillCorner JSON), samples 10-second windows, applies coordinate normalization and attack-direction alignment, renders tactical BEV frames on a realistic soccer pitch, and exports per clip:
 
-- `video.mp4`
+- `ground_truth.mp4`
 - `first_frame.png`
-- `last_frame.png`
+- `final_frame.png`
+- `prompt.txt`
+
+Output naming follows the [VBVR-DataFactory](https://github.com/Video-Reason/VBVR-DataFactory) convention.
 
 ## Features
 
@@ -35,7 +38,7 @@ The project ingests tracking data (Metrica CSV pair or SkillCorner JSON), sample
   - Support distance / ratio
   - Defense shape
   - Majority possession coherence
-- **Strict output contract** per clip directory (only 3 visual files)
+- **VBVR-aligned output contract** per clip directory (4 files: `ground_truth.mp4`, `first_frame.png`, `final_frame.png`, `prompt.txt`)
 
 ## Install
 
@@ -68,7 +71,7 @@ python soccer_bev_pipeline.py --mode metrica \
   --home_csv sample_data/metrica_official/data/Sample_Game_1/Sample_Game_1_RawTrackingData_Home_Team.csv \
   --away_csv sample_data/metrica_official/data/Sample_Game_1/Sample_Game_1_RawTrackingData_Away_Team.csv \
   --output_root output \
-  --clip_id my_clip \
+  --clip_id soccer_bev_00000000 \
   --fps 25 \
   --seconds 10 \
   --seed 42
@@ -82,7 +85,7 @@ python soccer_bev_pipeline.py --mode metrica \
   --away_csv /path/to/away.csv \
   --output_root output \
   --num_clips 1000 \
-  --clip_id_prefix clip \
+  --clip_id_prefix soccer_bev \
   --clip_index_offset 0 \
   --fps 25 \
   --seconds 10 \
@@ -95,7 +98,7 @@ python soccer_bev_pipeline.py --mode metrica \
 python soccer_bev_pipeline.py --mode skillcorner \
   --tracking_json /path/to/tracking.json \
   --output_root output \
-  --clip_id clip_0001 \
+  --clip_id soccer_bev_00000000 \
   --fps 25 \
   --seconds 10 \
   --seed 42
@@ -152,12 +155,24 @@ python soccer_bev_pipeline.py --mode skillcorner \
 
 ## Output Layout
 
+Follows [VBVR-DataFactory](https://github.com/Video-Reason/VBVR-DataFactory) naming convention:
+
 ```text
-output/clip_0000123/
-├── video.mp4         # 10s BEV video (25fps)
-├── first_frame.png   # First frame snapshot
-└── last_frame.png    # Last frame snapshot
+output/soccer_bev_00000000/
+├── ground_truth.mp4   # 10s BEV video (25fps)
+├── first_frame.png    # First frame snapshot
+├── final_frame.png    # Last frame snapshot
+└── prompt.txt         # Tactical description
+
+output/soccer_bev_00000001/
+├── ground_truth.mp4
+├── first_frame.png
+├── final_frame.png
+└── prompt.txt
+...
 ```
+
+Instance folders use 8-digit zero-padded indices (`_00000000`, `_00000001`, ...).
 
 ## Architecture
 
@@ -181,7 +196,10 @@ soccer_bev_pipeline.py
 ├── BEVRenderer
 │   ├── _draw_pitch()             — full FIFA-standard pitch markings
 │   └── render_frames()           — tactical dots on pitch background
-└── export_vbvr_clip()            — video.mp4 + first/last frame PNGs
+├── Prompt Generator
+│   ├── analyze_clip_events()     — possession, passes, ball movement from tracking
+│   └── generate_clip_prompt()    — English tactical description
+└── export_vbvr_clip()            — ground_truth.mp4 + first/final frame PNGs + prompt.txt
 ```
 
 ## AWS / 1M Scale Notes

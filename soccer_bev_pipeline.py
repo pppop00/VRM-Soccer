@@ -6,10 +6,11 @@ Supports:
 - Metrica-style tracking CSVs (home + away)
 - SkillCorner-style tracking JSON
 
-Outputs per clip directory:
-- video.mp4
+Outputs per clip directory (VBVR-aligned):
+- ground_truth.mp4
 - first_frame.png
-- last_frame.png
+- final_frame.png
+- prompt.txt
 """
 
 from __future__ import annotations
@@ -385,6 +386,181 @@ def evaluate_clip_realism(clip: ParsedTrackingClip, config: RealismConfig) -> Cl
         reasons.append("defense_shape_unrealistic")
 
     return ClipRealismReport(passed=(len(reasons) == 0), reasons=reasons, metrics=metrics)
+
+
+@dataclass
+class ClipAnalysis:
+    dominant_team: str
+    dominant_team_poss_ratio: float
+    possession_changes: int
+    pass_count: int
+    ball_advance_m: float
+    ball_lateral_m: float
+    clip_duration_s: float
+    possession_change_times_s: list[float]
+
+
+def analyze_clip_events(
+    clip: ParsedTrackingClip,
+    coords: np.ndarray,
+) -> ClipAnalysis:
+    num_frames = coords.shape[0]
+    fps = clip.fps
+    duration_s = num_frames / fps
+
+    ball_idx_arr = np.where(np.array([a == AgentType.BALL for a in clip.agent_types]))[0]
+    if ball_idx_arr.size == 0:
+        return ClipAnalysis("unknown", 0.0, 0, 0, 0.0, 0.0, duration_s, [])
+    ball_idx = int(ball_idx_arr[0])
+    ball_xy = coords[:, ball_idx, :]
+
+    home_mask = np.array([a == AgentType.HOME for a in clip.agent_types], dtype=bool)
+    away_mask = np.array([a == AgentType.AWAY for a in clip.agent_types], dtype=bool)
+    home_indices = np.where(home_mask)[0]
+    away_indices = np.where(away_mask)[0]
+
+    frame_team: list[Optional[str]] = [None] * num_frames
+    frame_nearest_id: list[Optional[str]] = [None] * num_frames
+
+    for t in range(num_frames):
+        bx, by = float(ball_xy[t, 0]), float(ball_xy[t, 1])
+        if not (np.isfinite(bx) and np.isfinite(by)):
+            continue
+
+        best_dist = np.inf
+        best_team: Optional[str] = None
+        best_agent: Optional[str] = None
+
+        for idx_set, team_label in [(home_indices, AgentType.HOME.value), (away_indices, AgentType.AWAY.value)]:
+            for ai in idx_set:
+                px, py = float(coords[t, ai, 0]), float(coords[t, ai, 1])
+                if not (np.isfinite(px) and np.isfinite(py)):
+                    continue
+                d = (px - bx) ** 2 + (py - by) ** 2
+                if d < best_dist:
+                    best_dist = d
+                    best_team = team_label
+                    best_agent = clip.agent_ids[ai]
+
+        frame_team[t] = best_team
+        frame_nearest_id[t] = best_agent
+
+    home_count = sum(1 for t in frame_team if t == AgentType.HOME.value)
+    away_count = sum(1 for t in frame_team if t == AgentType.AWAY.value)
+    total = home_count + away_count
+    if total == 0:
+        return ClipAnalysis("unknown", 0.0, 0, 0, 0.0, 0.0, duration_s, [])
+
+    dominant = AgentType.HOME.value if home_count >= away_count else AgentType.AWAY.value
+    dom_ratio = max(home_count, away_count) / total
+
+    min_hold_frames = max(1, int(fps * 0.4))
+    smoothed_team: list[Optional[str]] = list(frame_team)
+    run_start = 0
+    for t in range(1, num_frames + 1):
+        if t < num_frames and frame_team[t] == frame_team[run_start]:
+            continue
+        if t - run_start < min_hold_frames and run_start > 0:
+            for j in range(run_start, t):
+                smoothed_team[j] = smoothed_team[run_start - 1]
+        run_start = t
+
+    possession_changes = 0
+    change_times: list[float] = []
+    prev_team: Optional[str] = None
+    for t in range(num_frames):
+        if smoothed_team[t] is None:
+            continue
+        if prev_team is not None and smoothed_team[t] != prev_team:
+            possession_changes += 1
+            change_times.append(t / fps)
+        prev_team = smoothed_team[t]
+
+    pass_count = 0
+    prev_carrier: Optional[str] = None
+    prev_carrier_team: Optional[str] = None
+    for t in range(num_frames):
+        carrier = frame_nearest_id[t]
+        team = smoothed_team[t]
+        if carrier is None or team is None:
+            continue
+        if prev_carrier is not None and carrier != prev_carrier and team == prev_carrier_team:
+            pass_count += 1
+        prev_carrier = carrier
+        prev_carrier_team = team
+
+    valid_start = None
+    valid_end = None
+    for t in range(num_frames):
+        if np.isfinite(ball_xy[t, 0]):
+            if valid_start is None:
+                valid_start = t
+            valid_end = t
+    if valid_start is not None and valid_end is not None and valid_start != valid_end:
+        ball_advance_m = float(ball_xy[valid_end, 0] - ball_xy[valid_start, 0])
+        ball_lateral_m = float(ball_xy[valid_end, 1] - ball_xy[valid_start, 1])
+    else:
+        ball_advance_m = 0.0
+        ball_lateral_m = 0.0
+
+    return ClipAnalysis(
+        dominant_team=dominant,
+        dominant_team_poss_ratio=dom_ratio,
+        possession_changes=possession_changes,
+        pass_count=pass_count,
+        ball_advance_m=ball_advance_m,
+        ball_lateral_m=ball_lateral_m,
+        clip_duration_s=duration_s,
+        possession_change_times_s=change_times,
+    )
+
+
+def generate_clip_prompt(analysis: ClipAnalysis) -> str:
+    team = analysis.dominant_team
+    dur = analysis.clip_duration_s
+    adv = analysis.ball_advance_m
+    lat = analysis.ball_lateral_m
+    passes = analysis.pass_count
+    changes = analysis.possession_changes
+
+    if abs(adv) < 2.0:
+        move_desc = "with the ball held in a relatively static position"
+    else:
+        fwd = "forward toward the opponent's goal" if adv > 0 else "backward toward their own goal"
+        move_desc = f"with the ball advancing {abs(adv):.1f}m {fwd}"
+
+    if abs(lat) > 5.0:
+        side = "upper" if lat > 0 else "lower"
+        move_desc += f" and shifting {abs(lat):.1f}m toward the {side} flank"
+
+    if passes == 0:
+        pass_desc = "No completed passes are detected"
+    elif passes == 1:
+        pass_desc = f"1 pass is completed among {team} players"
+    else:
+        pass_desc = f"{passes} passes are completed among {team} players"
+
+    if changes == 0:
+        change_desc = "No possession change occurs during this sequence."
+    elif changes == 1:
+        t_str = f" at approximately {analysis.possession_change_times_s[0]:.1f}s"
+        change_desc = f"1 possession change occurs{t_str}."
+    else:
+        change_desc = f"{changes} possession changes occur during this sequence."
+
+    poss_pct = analysis.dominant_team_poss_ratio * 100
+    prompt = (
+        f"In this {dur:.0f}-second clip, the {team} team dominates possession "
+        f"({poss_pct:.0f}% of frames) moving left to right, "
+        f"{move_desc}. {pass_desc}. {change_desc}"
+    )
+    return prompt
+
+
+def export_prompt_txt(prompt: str, output_dir: str | Path) -> None:
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
 
 class DataParser(ABC):
@@ -1173,17 +1349,15 @@ def export_vbvr_clip(frames: list[np.ndarray], output_dir: str | Path, fps: int)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Enforce strict visual output contract by cleaning stale visual files first.
-    keep_names = {"video.mp4", "first_frame.png", "last_frame.png"}
+    keep_names = {"ground_truth.mp4", "first_frame.png", "final_frame.png", "prompt.txt"}
     for ext in ("*.mp4", "*.png", "*.jpg", "*.jpeg"):
         for candidate in out_dir.glob(ext):
             if candidate.name not in keep_names and candidate.is_file():
                 candidate.unlink()
 
-    # Replace exactly these three required visual files.
-    video_path = out_dir / "video.mp4"
+    video_path = out_dir / "ground_truth.mp4"
     first_path = out_dir / "first_frame.png"
-    last_path = out_dir / "last_frame.png"
+    last_path = out_dir / "final_frame.png"
 
     h, w = frames[0].shape[:2]
     for idx, fr in enumerate(frames):
@@ -1211,7 +1385,7 @@ def export_vbvr_clip(frames: list[np.ndarray], output_dir: str | Path, fps: int)
     ok1 = cv2.imwrite(str(first_path), frames[0])
     ok2 = cv2.imwrite(str(last_path), frames[-1])
     if not ok1 or not ok2:
-        raise RuntimeError("Failed to write first_frame.png or last_frame.png.")
+        raise RuntimeError("Failed to write first_frame.png or final_frame.png.")
 
 
 def _clip_start_bounds(parser: DataParser, num_frames: int) -> tuple[int, int]:
@@ -1338,8 +1512,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tracking_json", type=str, default=None, help="SkillCorner tracking JSON path.")
 
     parser.add_argument("--output_root", type=str, default="output")
-    parser.add_argument("--clip_id", type=str, default="clip_0001")
-    parser.add_argument("--clip_id_prefix", type=str, default="clip")
+    parser.add_argument("--clip_id", type=str, default="soccer_bev_00000000")
+    parser.add_argument("--clip_id_prefix", type=str, default="soccer_bev")
     parser.add_argument("--num_clips", type=int, default=1)
     parser.add_argument("--clip_index_offset", type=int, default=0)
     parser.add_argument("--fps", type=int, default=25)
@@ -1431,13 +1605,18 @@ def main() -> None:
         clip = data_parser.parse_clip(start_frame=spec.start_frame, num_frames=clip_frames, fps=args.fps)
         frames = renderer.render_frames(clip, normalize_orientation=normalize_orientation)
 
+        norm_coords, _, _ = normalize_attack_direction(clip.coords_xy, clip)
+        analysis = analyze_clip_events(clip, norm_coords)
+        prompt_text = generate_clip_prompt(analysis)
+
         if args.num_clips == 1:
             clip_id = args.clip_id
         else:
-            clip_id = f"{args.clip_id_prefix}_{spec.logical_clip_index:07d}"
+            clip_id = f"{args.clip_id_prefix}_{spec.logical_clip_index:08d}"
 
         out_dir = Path(args.output_root) / clip_id
         export_vbvr_clip(frames, out_dir, fps=args.fps)
+        export_prompt_txt(prompt_text, out_dir)
 
         print(
             f"[{idx + 1}/{len(sampled_specs)}] Export complete: mode={args.mode}, "
