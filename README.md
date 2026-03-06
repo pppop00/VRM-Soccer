@@ -238,6 +238,39 @@ python3 -m unittest discover -s tests -v
 - Keep `--allow_duplicate_starts` disabled unless you explicitly accept repeated windows.
 - Tune realism thresholds to balance quality vs throughput.
 
+## AWS / EC2 -> S3
+
+Use [scripts/run_pipeline_to_s3.sh](/Users/pppop/Desktop/Projects/Video-Reason-Soccer/scripts/run_pipeline_to_s3.sh) for EC2 jobs. It runs the pipeline against local files on the instance, syncs the generated clip folders to S3, and deletes the local batch by default.
+
+Metrica example:
+
+```bash
+scripts/run_pipeline_to_s3.sh \
+  --dataset metrica \
+  --home-csv sample_data/metrica_official/data/Sample_Game_2/Sample_Game_2_RawTrackingData_Home_Team.csv \
+  --away-csv sample_data/metrica_official/data/Sample_Game_2/Sample_Game_2_RawTrackingData_Away_Team.csv \
+  --s3-bucket videosoccer \
+  --s3-prefix vrm-soccer/metrica/run_0001 \
+  -- --num_clips 100 --fps 25 --seconds 10 --seed 20260306
+```
+
+SkillCorner example:
+
+```bash
+scripts/run_pipeline_to_s3.sh \
+  --dataset skillcorner_v2 \
+  --tracking-json sample_data/skillcorner_opendata/data/matches/1886347/1886347_tracking_extrapolated.jsonl \
+  --match-json sample_data/skillcorner_opendata/data/matches/1886347/1886347_match.json \
+  --s3-bucket videosoccer \
+  --s3-prefix vrm-soccer/skillcorner/run_0001 \
+  -- --num_clips 3 --fps 10 --seconds 10 --seed 20260306
+```
+
+Notes:
+- The EC2 instance must already have an IAM role with S3 write access.
+- S3 is the durable output store. EC2 local disk is only a temporary staging area.
+- Use `--keep-local` if you want to inspect generated files on the instance before cleanup.
+
 ## License
 
 Apache-2.0. See `LICENSE`.
