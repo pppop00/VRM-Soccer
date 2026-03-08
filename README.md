@@ -61,7 +61,8 @@ Apache License 2.0
 8. [用例深度分析](#8-用例深度分析)
 9. [关键挑战](#9-关键挑战)
 10. [参考文献](#10-参考文献)
-11. [工程文档（Quick Start）](#11-工程文档quick-start)
+11. [验证体系（Model Output Validation）](#11-验证体系model-output-validation)
+12. [工程文档（Quick Start）](#12-工程文档quick-start)
 
 ---
 
@@ -576,7 +577,179 @@ $$xT(z) = \underbrace{s(z) \cdot g(z)}_{\text{射门期望}} + \underbrace{m(z) 
 
 ---
 
-## 11. 工程文档（Quick Start）
+## 11. 验证体系（Model Output Validation）
+
+### 11.1 核心问题
+
+模型训练完成后，如何量化它的输出质量？足球战术预测的 ground truth 是**真实的球员/球坐标**，模型预测的是**未来时刻的位置**。验证工具需要对齐这两者并计算误差。
+
+### 11.2 数据流
+
+```
+[Pipeline 阶段] soccer_bev_pipeline.py
+    输出 ground_truth.mp4    ←── 视觉确认用
+    输出 ground_truth.json   ←── 验证工具的对比基准（需开启 --export_ground_truth_json）
+
+[模型推理阶段]
+    输入：first_frame.png + prompt.txt（或前 K 帧视频）
+    输出：prediction.json（每帧每个 agent 的预测坐标）
+
+[验证阶段] scripts/validate_predictions.py
+    读取 ground_truth.json  ──┐
+    读取 prediction.json    ──┴──▶ 对齐 frame_offset + agent_id ──▶ 计算指标 ──▶ report.json
+```
+
+### 11.3 文件格式合约
+
+**`ground_truth.json`**（pipeline 输出，坐标单位：米，攻击方向已归一化）：
+
+```json
+{
+  "clip_id": "soccer_bev_00000000",
+  "fps": 25,
+  "pitch_length_m": 105.0,
+  "pitch_width_m": 68.0,
+  "agent_ids": ["ball", "home_1", "home_2", "away_1", "..."],
+  "agent_types": ["ball", "home", "home", "away", "..."],
+  "frames": [
+    {
+      "frame_offset": 0,
+      "agents": [
+        {"agent_id": "ball",   "x": 52.3, "y": 34.1},
+        {"agent_id": "home_1", "x": 45.2, "y": 28.7}
+      ]
+    }
+  ]
+}
+```
+
+**`prediction.json`**（模型输出，格式与上面对称）：
+
+```json
+{
+  "clip_id": "soccer_bev_00000000",
+  "predicted_frames": [
+    {
+      "frame_offset": 125,
+      "agents": [
+        {"agent_id": "ball",   "x": 54.1, "y": 35.2},
+        {"agent_id": "home_1", "x": 46.0, "y": 29.3}
+      ]
+    }
+  ]
+}
+```
+
+> **关键设计**：`frame_offset` 是相对 clip 起点的帧编号。模型只需预测它关心的帧（例如最后一帧 `T-1`），不需要预测全部帧。验证工具按 `frame_offset + agent_id` 对齐，缺失帧不计入指标。
+
+### 11.4 三层评估指标
+
+#### Layer 1 — 位置精度（主要指标）
+
+| 指标 | 计算方式 | 单位 | 说明 |
+|------|---------|------|------|
+| **Ball ADE** | $\frac{1}{T}\sum_{t} \lVert \hat{p}^{\text{ball}}_t - p^{\text{ball}}_t \rVert_2$ | 米 | 球的平均位移误差，越低越好 |
+| **Ball FDE** | $\lVert \hat{p}^{\text{ball}}_T - p^{\text{ball}}_T \rVert_2$ | 米 | 球的终点位移误差 |
+| **Player ADE** | 同上，对所有球员平均 | 米 | 球员整体位置误差 |
+| **Miss Rate (ball)** | $\% \text{ of clips where Ball FDE} > 2\text{m}$ | % | 大误差比例（越低越好） |
+| **Miss Rate (player)** | $\% \text{ of clips where Player FDE} > 5\text{m}$ | % | — |
+
+参考基线：随机猜测（球场中心）Ball ADE ≈ 25m；静止预测（不动）Ball ADE ≈ 实际球运动距离均值（约 5–15m/10s）。
+
+#### Layer 2 — 物理一致性（自动可计算）
+
+检查模型输出是否违反基本物理约束：
+
+| 检查项 | 阈值 | 说明 |
+|-------|------|------|
+| 球员速度超限 | > 12 m/s | 顶级球员极限冲刺速度 ~11.5 m/s |
+| 球速度超限 | > 35 m/s | 顶级射门球速 ~33 m/s |
+| 坐标出界 | x ∉ [0, 105] 或 y ∉ [0, 68] | 预测位置超出球场 |
+| 轨迹跳变 | 相邻帧位移 > 5m（球员）/ 10m（球） | 帧间连续性检查 |
+
+输出：`physics_violations` 计数 + 违规帧列表。
+
+#### Layer 3 — 战术一致性（后期扩展）
+
+| 检查项 | 方法 | 现状 |
+|-------|------|------|
+| 越位检测 | 最后一名防守球员位置 vs 进攻球员 x 坐标 | 可基于预测坐标自动算 |
+| 阵型连续性 | 相邻帧阵型中心点变化 | 启发式 |
+| 持球一致性 | 预测持球方与 prompt.txt 一致性 | 需 NLP 对比 |
+
+### 11.5 validate_predictions.py 用法
+
+```bash
+# 单 clip 验证
+python scripts/validate_predictions.py \
+  --clip_dir output/soccer_bev_00000000 \
+  --pred_json predictions/pred_00000000.json
+
+# 输出到 JSON 报告
+python scripts/validate_predictions.py \
+  --clip_dir output/soccer_bev_00000000 \
+  --pred_json predictions/pred_00000000.json \
+  --report_json reports/report_00000000.json
+
+# 批量验证（glob 模式）
+python scripts/validate_predictions.py \
+  --clip_dir_glob "output/soccer_bev_*" \
+  --pred_dir predictions/ \
+  --report_json reports/summary.json
+```
+
+**终端输出示例**：
+
+```
+clip_id: soccer_bev_00000000
+predicted frames: 5 / 250 total frames
+──────────────────────────────────────
+POSITION ACCURACY
+  Ball  ADE:  3.21 m    FDE:  4.87 m
+  Player ADE: 2.14 m    FDE:  3.60 m
+  Miss Rate (ball >2m):   80.0%
+  Miss Rate (player >5m): 20.0%
+
+PHYSICS CHECK
+  Speed violations (ball):   0 / 5 frames
+  Speed violations (player): 0 / 5 frames
+  Out-of-bounds:             0 / 5 frames
+  Teleportation:             0 transitions
+──────────────────────────────────────
+OVERALL: PASS (no physics violations)
+```
+
+### 11.6 如何生成 ground_truth.json
+
+Pipeline 加 `--export_ground_truth_json` flag 即可在每个 clip 目录下额外输出 `ground_truth.json`：
+
+```bash
+python soccer_bev_pipeline.py --dataset metrica \
+  --home_csv /path/to/home.csv \
+  --away_csv /path/to/away.csv \
+  --output_root output \
+  --num_clips 100 \
+  --export_ground_truth_json   # ← 新增 flag
+```
+
+> **注**：`--export_ground_truth_json` 尚未实现，这是下一步的工程任务（修改 `soccer_bev_pipeline.py`，在 `export_vbvr_clip()` 之后调用 `export_ground_truth_json(clip, norm_coords, out_dir, clip_id)`）。
+
+### 11.7 评估 Baseline 建议
+
+在正式跑 LVM 之前，先建立这些 baseline 以确认 pipeline 正确：
+
+| Baseline | 方法 | 预期 Ball FDE |
+|---------|------|-------------|
+| **Zero-velocity** | 预测球停在第 1 帧位置不动 | ~5–15m（取决于 clip） |
+| **Constant-velocity** | 线性外推第 1 帧速度 | ~3–8m |
+| **Copy last frame** | 预测 = 最后一个已知帧 | ~1–5m |
+| **LVM (目标)** | 本项目模型 | < Copy last frame |
+
+如果 LVM 无法超越 Copy-last-frame baseline，说明模型没有学到有意义的战术信息。
+
+---
+
+## 12. 工程文档（Quick Start）
 
 本节为 VRM-Soccer pipeline 的工程使用文档。上方研究部分阐述了**为什么**这套 pipeline 构建这样的数据；本节说明**如何**运行它。
 
