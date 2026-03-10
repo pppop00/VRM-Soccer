@@ -3,13 +3,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from soccer_bev_pipeline import (
+    AgentType,
     CANONICAL_REQUIRED_COLUMNS,
     MetricaAdapter,
     MetricaParser,
+    ParsedTrackingClip,
     SkillCornerAdapter,
+    analyze_clip_events,
     normalize_coordinates_inplace,
 )
 
@@ -68,6 +72,63 @@ class AdapterTests(unittest.TestCase):
         self.assertAlmostEqual(52.5, float(df.loc[1, "x"]), places=4)
         self.assertAlmostEqual(34.0, float(df.loc[1, "y"]), places=4)
 
+    def test_clip_analysis_counts_stable_passes_and_possession_changes(self) -> None:
+        clip, coords = self._build_analysis_clip(
+            stable_teams=[
+                AgentType.HOME.value,
+                AgentType.HOME.value,
+                AgentType.HOME.value,
+                AgentType.HOME.value,
+                AgentType.HOME.value,
+                AgentType.HOME.value,
+                AgentType.HOME.value,
+                AgentType.AWAY.value,
+                AgentType.AWAY.value,
+                AgentType.AWAY.value,
+            ],
+            carrier_ids=[
+                "home_1",
+                "home_1",
+                "home_1",
+                "home_1",
+                "home_2",
+                "home_2",
+                "home_2",
+                "away_1",
+                "away_1",
+                "away_1",
+            ],
+        )
+
+        analysis = analyze_clip_events(clip, coords)
+
+        self.assertEqual(AgentType.HOME.value, analysis.dominant_team)
+        self.assertAlmostEqual(0.7, analysis.dominant_team_poss_ratio, places=4)
+        self.assertEqual(1, analysis.pass_count)
+        self.assertEqual(1, analysis.possession_changes)
+        self.assertEqual([0.7], analysis.possession_change_times_s)
+
+    def test_clip_analysis_ignores_single_frame_carrier_jitter(self) -> None:
+        clip, coords = self._build_analysis_clip(
+            stable_teams=[AgentType.HOME.value] * 8,
+            carrier_ids=[
+                "home_1",
+                "home_1",
+                "home_1",
+                "home_2",
+                "home_1",
+                "home_1",
+                "home_1",
+                "home_1",
+            ],
+        )
+
+        analysis = analyze_clip_events(clip, coords)
+
+        self.assertEqual(0, analysis.pass_count)
+        self.assertEqual(0, analysis.possession_changes)
+        self.assertAlmostEqual(1.0, analysis.dominant_team_poss_ratio, places=4)
+
     @staticmethod
     def _write_metrica_pair(tmpdir: Path) -> tuple[Path, Path]:
         home_df = pd.DataFrame(
@@ -96,6 +157,54 @@ class AdapterTests(unittest.TestCase):
         home_df.to_csv(home_path, index=False)
         away_df.to_csv(away_path, index=False)
         return home_path, away_path
+
+    @staticmethod
+    def _build_analysis_clip(
+        stable_teams: list[str],
+        carrier_ids: list[str],
+    ) -> tuple[ParsedTrackingClip, np.ndarray]:
+        if len(stable_teams) != len(carrier_ids):
+            raise ValueError("stable_teams and carrier_ids must have equal length.")
+
+        agent_ids = ["home_1", "home_2", "away_1", "away_2", "ball"]
+        agent_types = np.array(
+            [
+                AgentType.HOME,
+                AgentType.HOME,
+                AgentType.AWAY,
+                AgentType.AWAY,
+                AgentType.BALL,
+            ],
+            dtype=object,
+        )
+
+        carrier_positions = {
+            "home_1": np.array([20.0, 20.0], dtype=np.float32),
+            "home_2": np.array([40.0, 20.0], dtype=np.float32),
+            "away_1": np.array([60.0, 20.0], dtype=np.float32),
+            "away_2": np.array([80.0, 20.0], dtype=np.float32),
+        }
+
+        num_frames = len(stable_teams)
+        coords = np.full((num_frames, len(agent_ids), 2), np.nan, dtype=np.float32)
+        player_order = ["home_1", "home_2", "away_1", "away_2"]
+
+        for t in range(num_frames):
+            for idx, player_id in enumerate(player_order):
+                coords[t, idx, :] = carrier_positions[player_id]
+            coords[t, 4, :] = carrier_positions[carrier_ids[t]]
+
+        clip = ParsedTrackingClip(
+            coords_xy=coords,
+            agent_ids=agent_ids,
+            agent_types=agent_types,
+            frame_ids=np.arange(num_frames, dtype=np.int32),
+            fps=10,
+            pitch_length_m=105.0,
+            pitch_width_m=68.0,
+            possession_team_by_frame=np.array(stable_teams, dtype=object),
+        )
+        return clip, coords
 
 
 if __name__ == "__main__":

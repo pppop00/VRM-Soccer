@@ -422,6 +422,56 @@ class ClipAnalysis:
     possession_change_times_s: list[float]
 
 
+def _stabilize_label_sequence(
+    labels: list[Optional[str]],
+    min_run_frames: int,
+) -> list[Optional[str]]:
+    if min_run_frames <= 1 or len(labels) <= 1:
+        return list(labels)
+
+    stable = list(labels)
+    for _ in range(2):
+        run_start = 0
+        for idx in range(1, len(stable) + 1):
+            if idx < len(stable) and stable[idx] == stable[run_start]:
+                continue
+
+            run_value = stable[run_start]
+            run_len = idx - run_start
+            if run_len < min_run_frames:
+                prev_value = stable[run_start - 1] if run_start > 0 else None
+                next_value = stable[idx] if idx < len(stable) else None
+
+                replacement = None
+                if prev_value == next_value and prev_value is not None:
+                    replacement = prev_value
+                elif prev_value is not None:
+                    replacement = prev_value
+                elif next_value is not None:
+                    replacement = next_value
+
+                if replacement is not None:
+                    for j in range(run_start, idx):
+                        stable[j] = replacement
+
+            run_start = idx
+    return stable
+
+
+def _segment_labels(labels: list[Optional[str]]) -> list[tuple[int, int, Optional[str]]]:
+    if not labels:
+        return []
+
+    segments: list[tuple[int, int, Optional[str]]] = []
+    start = 0
+    for idx in range(1, len(labels) + 1):
+        if idx < len(labels) and labels[idx] == labels[start]:
+            continue
+        segments.append((start, idx, labels[start]))
+        start = idx
+    return segments
+
+
 def analyze_clip_events(
     clip: ParsedTrackingClip,
     coords: np.ndarray,
@@ -441,72 +491,80 @@ def analyze_clip_events(
     home_indices = np.where(home_mask)[0]
     away_indices = np.where(away_mask)[0]
 
-    frame_team: list[Optional[str]] = [None] * num_frames
+    raw_team: list[Optional[str]] = [None] * num_frames
+    if clip.possession_team_by_frame is not None and len(clip.possession_team_by_frame) == num_frames:
+        raw_team = [_normalize_team_label(value) for value in clip.possession_team_by_frame]
+    else:
+        inferred = infer_possession_by_proximity(coords, clip.agent_types)
+        raw_team = [_normalize_team_label(value) for value in inferred]
+
+    min_team_hold_frames = max(2, int(round(fps * 0.2)))
+    stable_team = _stabilize_label_sequence(raw_team, min_team_hold_frames)
+
     frame_nearest_id: list[Optional[str]] = [None] * num_frames
+    control_radius_m = 4.0
 
     for t in range(num_frames):
         bx, by = float(ball_xy[t, 0]), float(ball_xy[t, 1])
         if not (np.isfinite(bx) and np.isfinite(by)):
             continue
 
+        team_label = stable_team[t]
+        if team_label == AgentType.HOME.value:
+            candidate_indices = home_indices
+        elif team_label == AgentType.AWAY.value:
+            candidate_indices = away_indices
+        else:
+            continue
+
         best_dist = np.inf
-        best_team: Optional[str] = None
         best_agent: Optional[str] = None
 
-        for idx_set, team_label in [(home_indices, AgentType.HOME.value), (away_indices, AgentType.AWAY.value)]:
-            for ai in idx_set:
-                px, py = float(coords[t, ai, 0]), float(coords[t, ai, 1])
-                if not (np.isfinite(px) and np.isfinite(py)):
-                    continue
-                d = (px - bx) ** 2 + (py - by) ** 2
-                if d < best_dist:
-                    best_dist = d
-                    best_team = team_label
-                    best_agent = clip.agent_ids[ai]
+        for ai in candidate_indices:
+            px, py = float(coords[t, ai, 0]), float(coords[t, ai, 1])
+            if not (np.isfinite(px) and np.isfinite(py)):
+                continue
+            d = float(np.hypot(px - bx, py - by))
+            if d < best_dist:
+                best_dist = d
+                best_agent = clip.agent_ids[ai]
 
-        frame_team[t] = best_team
-        frame_nearest_id[t] = best_agent
+        if best_agent is not None and best_dist <= control_radius_m:
+            frame_nearest_id[t] = best_agent
 
-    home_count = sum(1 for t in frame_team if t == AgentType.HOME.value)
-    away_count = sum(1 for t in frame_team if t == AgentType.AWAY.value)
-    total = home_count + away_count
-    if total == 0:
+    min_carrier_hold_frames = max(2, int(round(fps * 0.2)))
+    stable_carrier = _stabilize_label_sequence(frame_nearest_id, min_carrier_hold_frames)
+
+    home_count = sum(1 for value in stable_team if value == AgentType.HOME.value)
+    away_count = sum(1 for value in stable_team if value == AgentType.AWAY.value)
+    if home_count == 0 and away_count == 0:
         return ClipAnalysis("unknown", 0.0, 0, 0, 0.0, 0.0, duration_s, [])
 
     dominant = AgentType.HOME.value if home_count >= away_count else AgentType.AWAY.value
-    dom_ratio = max(home_count, away_count) / total
-
-    min_hold_frames = max(1, int(fps * 0.4))
-    smoothed_team: list[Optional[str]] = list(frame_team)
-    run_start = 0
-    for t in range(1, num_frames + 1):
-        if t < num_frames and frame_team[t] == frame_team[run_start]:
-            continue
-        if t - run_start < min_hold_frames and run_start > 0:
-            for j in range(run_start, t):
-                smoothed_team[j] = smoothed_team[run_start - 1]
-        run_start = t
+    dom_ratio = max(home_count, away_count) / max(1, num_frames)
 
     possession_changes = 0
     change_times: list[float] = []
     prev_team: Optional[str] = None
-    for t in range(num_frames):
-        if smoothed_team[t] is None:
+    for seg_start, _, seg_team in _segment_labels(stable_team):
+        if seg_team is None:
             continue
-        if prev_team is not None and smoothed_team[t] != prev_team:
+        if prev_team is not None and seg_team != prev_team:
             possession_changes += 1
-            change_times.append(t / fps)
-        prev_team = smoothed_team[t]
+            change_times.append(seg_start / fps)
+        prev_team = seg_team
 
     pass_count = 0
     prev_carrier: Optional[str] = None
     prev_carrier_team: Optional[str] = None
-    for t in range(num_frames):
-        carrier = frame_nearest_id[t]
-        team = smoothed_team[t]
-        if carrier is None or team is None:
+    for seg_start, seg_end, carrier in _segment_labels(stable_carrier):
+        if carrier is None:
             continue
-        if prev_carrier is not None and carrier != prev_carrier and team == prev_carrier_team:
+        team_slice = [value for value in stable_team[seg_start:seg_end] if value is not None]
+        if not team_slice:
+            continue
+        team = max(set(team_slice), key=team_slice.count)
+        if prev_carrier is not None and prev_carrier_team == team and prev_carrier != carrier:
             pass_count += 1
         prev_carrier = carrier
         prev_carrier_team = team
