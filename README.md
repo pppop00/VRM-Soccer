@@ -923,106 +923,117 @@ scripts/run_pipeline_to_s3.sh \
 
 ---
 
-## 13. V2V 输出量化评估框架（VBVR-Bench 对齐）
+## 13. V2V 输出量化评估框架
 
-借鉴 VBVR 五大认知支柱（Perception / Knowledge / Spatiality / Transformation / Abstraction），为 V2V 模型输出建立一套 **Rule-based 可验证评估体系**，避免 VLM-as-judge 的幻觉和随机性（ICLR 2025 研究证明 rule-based 与人类偏好 Spearman > 0.9，优于 MLLM 评判）。
+给定一个 clip 的 ground_truth.mp4（22 个彩色圆点在绿色球场上运动），V2V 模型生成对应的预测视频后，`scorer.py` 从五个维度自动打分，全部基于规则计算，不调用 MLLM（ICLR 2025 研究证明 rule-based 与人类偏好 Spearman > 0.9，优于 MLLM 评判）。
 
-当前实现：`scorer.py`（D1–D5，五维加权综合分）。
+$$S_{total} = w_1 D1 + w_2 D2 + w_3 D3 + w_4 D4 + w_5 D5$$
 
-### 综合评分公式
-
-$$S_{total} = w_1 \cdot DINO_{subj} + w_2 \cdot RAFT_{flow} + w_3 \cdot PHY_{comply} + w_4 \cdot WCS + w_5 \cdot CLIP_{prompt}$$
-
-默认权重：`{"D1":0.2, "D2":0.2, "D3":0.2, "D4":0.2, "D5":0.2}`，可通过 `--weights` 覆盖。
+默认权重各 0.2，可通过 `--weights` 覆盖。VBVR 学术对齐：D1 → Perception，D2 → Transformation，D3/D4 → Knowledge，D5 → Abstraction。
 
 ---
 
-### 维度一：感知量化（Perception）
+### D1 · Visual Quality — 点在不在？
 
-衡量模型在执行变换时保留视觉结构的能力。
+**问题：生成视频里各帧的球员/球位置，和 ground truth 差多少？**
 
-| 指标 | 方法 | 文献依据 | 实现状态 |
-|------|------|---------|---------|
-| **主体一致性**（D1） | 跨帧 DINOv2 特征余弦相似度 | VBench CVPR 2024；DIVE ICCV 2025 | ✅ `scorer.py` SSIM 基线；**升级路径：DINOv2 ViT-S/8** |
-| **动态程度** | RAFT 光流场均值幅度 | VBench Dynamic Degree；RAFT ECCV 2020 | ✅ D2 Farneback 基线；**升级路径：RAFT** |
-| **背景稳定性** | 分离前景/背景后计算 CLIP 特征余弦相似度 | DynamicEval NeurIPS 2024 | ⚠️ 纯 CLIP 不足（已知局限）；需前景分离 |
+逐帧计算 SSIM（结构相似度）。球在 (62m, 34m)，模型生成在 (61m, 35m)，SSIM ≈ 0.94；跑偏到 (52m, 50m) 则 SSIM ≈ 0.41。
 
-> **注**：直接用全帧 CLIP 做背景稳定性已被 DynamicEval 证明有偏，需先用分割模型剥离前景球员再计算背景帧差。
+升级路径：SSIM → DINOv2 跨帧特征相似度（VBench CVPR 2024）。
 
 ---
 
-### 维度二：知识量化（Knowledge）
+### D2 · Temporal Consistency — 移动是否流畅？
 
-评估生成视频是否符合物理法则和足球规则。**全部使用 rule-based 检查，不调用 MLLM。**
+**问题：相邻两帧之间，圆点的移动是否连贯，有没有闪烁/跳变？**
 
-| 指标 | 方法 | 文献依据 | 实现状态 |
-|------|------|---------|---------|
-| **物理合规分**（D3 核心） | 球轨迹水平动量守恒；速度上限检查（球员 10 m/s，球 35 m/s）；轨迹跳变检测 | Morpheus 2025；T2VPhysBench；VideoPhy-2 | ✅ `scorer.py:313–391` |
-| **世界一致性（WCS）** | Object Permanence（ByteTrack 追踪消失/重现）+ Relation Stability + Flicker Penalty | WCS arxiv 2508.00144 | ❌ **待实现**：加入 D3 扩展 |
-| **事件顺序合法性** | Rule checklist：进球 → 庆祝顺序约束，比赛阶段合法性 | RULER-Bench；VBVR-Bench | ❌ 后期扩展 |
+用光流 warping error 衡量帧间连续性。away_3 从 (30m, 20m) 一帧跳到 (55m, 40m)（瞬移 25m），warping error 飙高 → D2 扣分。
+
+升级路径：Farneback 光流 → RAFT（ECCV 2020）。
 
 ---
 
-### 维度三：空间性量化（Spatiality）
+### D3 · Physical Plausibility — 速度合不合理？
 
-> **BEV 阶段注意**：3D 结构相干性和深度图一致性（MiDaS/DPT）在 BEV 俯视图中**不适用**——BEV 本身是 2D 平面投影，不存在透视失真问题。这两项指标留待 Phase 3 广播视角接入时再实施。
+**问题：圆点的运动速度是否超出物理上限？球会不会飞出场地？**
 
-| 指标 | 方法 | 文献依据 | 实现状态 |
-|------|------|---------|---------|
-| **轨迹精度**（BEV 适用） | Fréchet distance / ADE / FDE：预测轨迹 vs ground_truth.json | VLN 领域 SPL 指标移植 | ✅ §11 已定义；`validate_predictions.py` |
-| **战术路径匹配** | 球员跑位轨迹 DTW 对比；pitch control 表面 Earth Mover's Distance | LaurieOnTracking | ❌ D6/D7 扩展规划 |
-| 3D 结构相干性 | 投影几何一致性（同名点重投影误差） | SfM / epipolar 几何 | ⏳ Phase 3（广播视角）|
-| 深度图一致性 | MiDaS / Depth-Anything 帧间深度梯度 | Depth-Anything 2024 | ⏳ Phase 3 |
+从每帧 HSV 颜色提取坐标 → 换算米单位 → 计算帧间速度：
 
----
+| 检查项 | 阈值 | 违规示例 |
+|--------|------|---------|
+| 球员速度 | > 10 m/s | away_3 帧间 160 m/s |
+| 球速度 | > 35 m/s | 球帧间 288 m/s |
+| 坐标出界 | x ∉ [0,105] 或 y ∉ [0,68] | 球出现在看台 |
+| 轨迹跳变 | 球员 > 5m/帧，球 > 10m/帧 | 瞬移检测 |
 
-### 维度四：转换量化（Transformation）
+输出违规明细：`{frame: 46, agent: "ball", type: "speed", value: 288}`。
 
-衡量模型对视觉表征进行受控操控的能力。
-
-| 指标 | 方法 | 文献依据 | 实现状态 |
-|------|------|---------|---------|
-| **时空连续性**（D2） | 光流 warping 误差；帧间 SSIM | Farneback / RAFT | ✅ `scorer.py:272–308` |
-| **受控编辑精度** | 编辑区域覆盖率（IoU）+ 非编辑区 LPIPS 保留率 | Emu Edit arxiv 2311.10089；InstructPix2Pix | ⏳ 当前无 instruction-following 任务；届时新增 `instruction_scorer.py` |
-| **几何变换遵循率** | 旋转/平移 RMSE vs 期望变换 | 同名点 Frobenius 范数 | ❌ 后期扩展 |
+待扩展：加入 WCS Object Permanence——用 ByteTrack 追踪球消失后是否在合理位置重现（arxiv 2508.00144）。
 
 ---
 
-### 维度五：抽象量化（Abstraction）
+### D4 · Tactical Coherence — 22 个点的关系对不对？
 
-测试模型从足球场景中提炼通用规则并迁移的能力。
+**问题：谁控球？进攻方向对不对？队友支援结构是否合理？**
 
-> **注**：视觉类比推理（A:B::C:? 格式）和模式补全 ROI 极低，**不建议实施**。以下采用跨运动迁移系数替代，直接支撑多运动扩展的论文故事。
+- **持球一致性**：球距离哪支队伍最近，判定持球方；检查是否与 prompt.txt 描述一致
+- **Support Ratio**：持球球员 20m 内队友数量 / 总队友数，衡量进攻支援结构
+- **Flicker Penalty**：持球方在短时间内反复翻转（主队→客队→主队）扣分
 
-| 指标 | 方法 | 实现状态 |
-|------|------|---------|
-| **跨运动迁移系数 ρ** | 计算 8 个任务族 × 4 种运动（足球/网球/篮球/棒球）的 Spearman ρ 矩阵；ρ > 0.8 表示该族具有通用推理能力 | ❌ Phase 2（多运动扩展后实施，约 1–2 周） |
+```
+ground truth：主队持续控球，support_ratio = 0.4
+模型生成：第55帧起判定客队持球，但 prompt 写"主队推进" → D4 扣分
+```
 
 ---
 
-### 当前 scorer.py 评分接口
+### D5 · Prompt Adherence — 和文字描述一致吗？
+
+**问题：生成视频的整体画面，是否符合 prompt.txt 描述的战术场景？**
+
+取生成视频关键帧 → 提取 CLIP embedding → 与 prompt.txt 文本计算余弦相似度：
+
+```
+prompt.txt："主队从左路推进，7号带球，攻击阶段"
+主队在左路进攻的画面 → similarity ≈ 0.31  ✅
+双方在中场拉锯的画面 → similarity ≈ 0.18  ❌
+```
+
+---
+
+### 使用
 
 ```bash
 # 单 clip 评分
 python scorer.py --instance_dir output/soccer_bev_00000000 --generated <generated.mp4>
 
-# 自定义维度权重
+# 自定义权重（例如更重视物理合规）
 python scorer.py \
   --instance_dir output/soccer_bev_00000000 \
   --generated generated.mp4 \
-  --weights '{"D1":0.3,"D2":0.1,"D3":0.2,"D4":0.2,"D5":0.2}'
+  --weights '{"D1":0.2,"D2":0.1,"D3":0.3,"D4":0.2,"D5":0.2}'
 ```
 
-输出：JSON 格式的五维得分 + 综合分 + 物理违规明细（违规帧号、agent_id、违规类型）。
+输出示例：
+
+```
+D1 Visual Quality:        0.68
+D2 Temporal Consistency:  0.45
+D3 Physical Plausibility: 0.30  [violations: 3 frames]
+D4 Tactical Coherence:    0.50
+D5 Prompt Adherence:      0.72
+─────────────────────────
+S_total:                  0.53
+```
 
 ### 扩展路线图
 
-| 优先级 | 新维度 | 依赖 | 工期 |
-|--------|--------|------|------|
+| 优先级 | 项目 | 依赖 | 工期 |
+|--------|------|------|------|
 | P1 | D1 升级：SSIM → DINOv2 主体一致性 | `timm` | ~1 天 |
 | P1 | D2 升级：Farneback → RAFT | `pytorch-raft` | ~1 天 |
-| P1 | D3 扩展：加入 WCS Object Permanence（ByteTrack） | `bytetrack` | ~3 天 |
-| P2 | D6：轨迹精度（Fréchet / ADE / FDE） | `scipy` | ~2 天 |
-| P2 | D7：战术阵型（EFPI Hungarian matching） | `unravelsports` | ~2 天 |
-| P3 | D8：Pitch Control 表面（EMD） | `LaurieOnTracking` | ~3 天 |
-| Phase 3 | 深度图一致性（广播视角） | `depth-anything` | 广播接入后 |
+| P1 | D3 扩展：WCS Object Permanence（ByteTrack） | `bytetrack` | ~3 天 |
+| P2 | D6：轨迹精度 Fréchet / ADE / FDE | `scipy` | ~2 天 |
+| P2 | D7：战术阵型 EFPI matching | `unravelsports` | ~2 天 |
+| P3 | D8：Pitch Control 表面 EMD | `LaurieOnTracking` | ~3 天 |
+| Phase 3 | 深度图一致性（广播视角接入后） | `depth-anything` | — |
