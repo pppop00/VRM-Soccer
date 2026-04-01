@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -595,52 +596,527 @@ def analyze_clip_events(
     )
 
 
-def generate_clip_prompt(analysis: ClipAnalysis) -> str:
-    team = analysis.dominant_team
-    dur = analysis.clip_duration_s
-    adv = analysis.ball_advance_m
-    lat = analysis.ball_lateral_m
-    passes = analysis.pass_count
-    changes = analysis.possession_changes
-
-    if abs(adv) < 2.0:
-        move_desc = "with the ball held in a relatively static position"
+def _get_ball_zone(ball_x_m: float, pitch_length: float = 105.0) -> str:
+    """Classify ball x position into pitch thirds."""
+    third = pitch_length / 3.0
+    if ball_x_m < third:
+        return "defensive"
+    elif ball_x_m < 2.0 * third:
+        return "middle"
     else:
-        fwd = "forward toward the opponent's goal" if adv > 0 else "backward toward their own goal"
-        move_desc = f"with the ball advancing {abs(adv):.1f}m {fwd}"
+        return "attacking"
 
-    if abs(lat) > 5.0:
-        side = "upper" if lat > 0 else "lower"
-        move_desc += f" and shifting {abs(lat):.1f}m toward the {side} flank"
 
-    if passes == 0:
-        pass_desc = "No completed passes are detected"
-    elif passes == 1:
-        pass_desc = f"1 pass is completed among {team} players"
+def _get_ball_channel(ball_y_m: float, pitch_width: float = 68.0) -> str:
+    """Classify ball y position into left/central/right channel."""
+    if ball_y_m < pitch_width * 0.3:
+        return "left"
+    elif ball_y_m > pitch_width * 0.7:
+        return "right"
     else:
-        pass_desc = f"{passes} passes are completed among {team} players"
+        return "central"
 
-    if changes == 0:
-        change_desc = "No possession change occurs during this sequence."
-    elif changes == 1:
-        t_str = f" at approximately {analysis.possession_change_times_s[0]:.1f}s"
-        change_desc = f"1 possession change occurs{t_str}."
-    else:
-        change_desc = f"{changes} possession changes occur during this sequence."
 
-    poss_pct = analysis.dominant_team_poss_ratio * 100
-    prompt = (
-        f"In this {dur:.0f}-second clip, the {team} team dominates possession "
-        f"({poss_pct:.0f}% of frames) moving left to right, "
-        f"{move_desc}. {pass_desc}. {change_desc}"
+def _estimate_formation(home_xs: np.ndarray) -> str:
+    """
+    Simplified formation estimation from home player x-coordinates.
+    Groups outfield players (all except GK = lowest x) into 3 lines.
+    Returns label like '4-3-3-like' or '4-4-2-like'.
+    """
+    if len(home_xs) < 4:
+        return "unknown"
+    sorted_xs = np.sort(home_xs)
+    # Skip GK (first = lowest x)
+    outfield = sorted_xs[1:]
+    n = len(outfield)
+    if n < 3:
+        return "unknown"
+    # Split into 3 lines by tertiles
+    line1 = int(round(n / 3.0))
+    line2 = int(round(2 * n / 3.0))
+    line3 = n - line2
+    line1 = max(1, line1)
+    line2 = max(1, line2 - line1)
+    line3 = max(1, line3)
+    return f"{line1}-{line2}-{line3}-like"
+
+
+def stride_clip(clip: "ParsedTrackingClip", stride: int) -> "ParsedTrackingClip":
+    """Return a new ParsedTrackingClip keeping every `stride`-th frame."""
+    if stride <= 1:
+        return clip
+    return ParsedTrackingClip(
+        coords_xy=clip.coords_xy[::stride],
+        agent_ids=clip.agent_ids,
+        agent_types=clip.agent_types,
+        frame_ids=clip.frame_ids[::stride],
+        fps=clip.fps,
+        pitch_length_m=clip.pitch_length_m,
+        pitch_width_m=clip.pitch_width_m,
+        possession_team_by_frame=(
+            clip.possession_team_by_frame[::stride]
+            if clip.possession_team_by_frame is not None else None
+        ),
     )
-    return prompt
+
+
+def generate_visual_prefix(
+    coords_xy: np.ndarray,
+    agent_ids: list[str],
+    pitch_length_m: float = 105.0,
+    pitch_width_m: float = 68.0,
+    agent_types: Optional[np.ndarray] = None,
+    flipped: bool = False,
+    zone_trajectory: Optional[dict] = None,
+) -> str:
+    """
+    Generate visual description layer for the BEV clip.
+    coords_xy: shape (num_frames, num_agents, 2) in metric meters (rendered frames only).
+    agent_types: if provided, used for counting home/away (more reliable than string matching).
+    flipped: True if attack direction was flipped (home attacks right-to-left in rendered video).
+    zone_trajectory: output of compute_ball_zone_trajectory(); if None falls back to mean position.
+    """
+    # Count home/away players
+    if agent_types is not None:
+        n_home = int(sum(1 for a in agent_types if a == AgentType.HOME))
+        n_away = int(sum(1 for a in agent_types if a == AgentType.AWAY))
+    else:
+        n_home = sum(1 for aid in agent_ids if "home" in str(aid).lower())
+        n_away = sum(1 for aid in agent_ids if "away" in str(aid).lower())
+
+    # Attack direction
+    if flipped:
+        direction_sentence = "The home team attacks from right to left."
+    else:
+        direction_sentence = "The home team attacks from left to right."
+
+    # Ball zone description
+    if zone_trajectory and zone_trajectory.get("zone_sequence"):
+        seq = zone_trajectory["zone_sequence"]
+        time_in_third = zone_trajectory.get("time_in_third", {})
+        is_traversal = zone_trajectory.get("is_traversal", False)
+
+        if is_traversal:
+            zone_sentence = (
+                "The ball traverses through the defensive, middle, and attacking thirds of the pitch."
+            )
+        elif len(seq) > 1:
+            zone_labels = [z.replace("-", " ") for z in seq[:3]]  # cap at 3 for readability
+            zone_sentence = f"The ball moves through the {', '.join(zone_labels)} zone{'s' if len(zone_labels) > 1 else ''}."
+        else:
+            if time_in_third:
+                dominant_third = max(time_in_third, key=time_in_third.get)
+                pct = int(time_in_third[dominant_third] * 100)
+                zone_sentence = f"The ball is primarily in the {dominant_third} third ({pct}% of the clip)."
+            else:
+                dominant = zone_trajectory.get("dominant_zone", seq[0]).replace("-", " ")
+                zone_sentence = f"The ball is in the {dominant} zone."
+    else:
+        # Fallback: mean position
+        ball_idx = next(
+            (i for i, aid in enumerate(agent_ids) if "ball" in str(aid).lower()), None
+        )
+        if ball_idx is not None:
+            ball_xy = coords_xy[:, ball_idx, :]
+            valid = ~np.isnan(ball_xy).any(axis=1)
+            if valid.any():
+                mean_ball_x = float(np.nanmean(ball_xy[valid, 0]))
+                mean_ball_y = float(np.nanmean(ball_xy[valid, 1]))
+                zone = _get_ball_zone(mean_ball_x, pitch_length_m)
+                channel = _get_ball_channel(mean_ball_y, pitch_width_m)
+                zone_sentence = f"The ball is in the {zone} third near the {channel} channel."
+            else:
+                zone_sentence = "The ball position is not tracked."
+        else:
+            zone_sentence = "The ball position is not tracked."
+
+    en = "SOCCER_BEV Red dots represent the home team, blue dots represent the away team, the yellow dot is the ball."
+    zh = "SOCCER_BEV 红色代表主队，蓝色代表客队，黄色圆点是足球。"
+
+    return en, zh
+
+
+def generate_clip_prompt(
+    analysis: ClipAnalysis,
+    coords_xy: Optional[np.ndarray] = None,
+    agent_ids: Optional[list[str]] = None,
+    pitch_length_m: float = 105.0,
+    pitch_width_m: float = 68.0,
+    time_scale: int = 1,
+    agent_types: Optional[np.ndarray] = None,
+    flipped: bool = False,
+    zone_trajectory: Optional[dict] = None,
+    motion_intensity: Optional[dict] = None,
+    events: Optional[dict] = None,
+) -> str:
+    """
+    Generate two-layer prompt: visual description + tactical description.
+    If coords_xy/agent_ids are provided, prepends a visual layer.
+    Compatible with Wan2.1 caption style (SOCCER_BEV trigger token).
+
+    events: output of load_events_for_clip() — uses ground-truth event labels when available.
+    zone_trajectory: output of compute_ball_zone_trajectory().
+    motion_intensity: output of compute_motion_intensity().
+    flipped: True if attack direction was flipped by normalize_attack_direction().
+    """
+    team = analysis.dominant_team
+    output_dur = analysis.clip_duration_s / time_scale
+    poss_pct = int(analysis.dominant_team_poss_ratio * 100)
+
+    # --- Time compression header ---
+    if time_scale > 1:
+        real_duration = analysis.clip_duration_s
+        time_header = (
+            f"This {output_dur:.0f}-second video covers {real_duration:.0f}s of real match play "
+            f"at {time_scale}\u00d7 time compression."
+        )
+    else:
+        time_header = f"In this {output_dur:.0f}-second clip,"
+
+    # --- Possession sentence ---
+    poss_sentence = f"The {team} team dominates possession ({poss_pct}% of the sequence)."
+
+    # --- Ball zone sentence ---
+    if zone_trajectory and zone_trajectory.get("time_in_third"):
+        time_in_third = zone_trajectory["time_in_third"]
+        is_traversal = zone_trajectory.get("is_traversal", False)
+        if is_traversal:
+            ball_sentence = "Play spans the full length of the pitch, moving through all three thirds."
+        else:
+            dominant_third = max(time_in_third, key=time_in_third.get)
+            pct = int(time_in_third[dominant_third] * 100)
+            ball_sentence = f"Play is concentrated in the {dominant_third} third ({pct}% of the clip)."
+    else:
+        ball_sentence = ""
+
+    # --- Event description ---
+    if events is not None:
+        # Ground-truth events from CSV
+        home_p = events.get("home_passes", 0)
+        away_p = events.get("away_passes", 0)
+        total_p = events.get("passes", home_p + away_p)
+        n_carries = events.get("carries", 0)
+        n_lost = events.get("ball_lost", 0)
+        n_challenges = events.get("challenges", 0)
+        n_set_pieces = events.get("set_pieces", 0)
+
+        event_parts: list[str] = []
+        if total_p > 0:
+            if home_p > 0 and away_p > 0:
+                event_parts.append(
+                    f"{home_p} home {'pass' if home_p == 1 else 'passes'} "
+                    f"and {away_p} away {'pass' if away_p == 1 else 'passes'}"
+                )
+            else:
+                event_parts.append(f"{total_p} {'pass' if total_p == 1 else 'passes'}")
+        if n_carries > 0:
+            event_parts.append(f"{n_carries} {'carry' if n_carries == 1 else 'carries'}")
+        if n_lost > 0:
+            event_parts.append(
+                f"{n_lost} possession {'turnover' if n_lost == 1 else 'turnovers'}"
+            )
+        if n_challenges > 0:
+            event_parts.append(
+                f"{n_challenges} physical {'challenge' if n_challenges == 1 else 'challenges'}"
+            )
+        if n_set_pieces > 0:
+            event_parts.append(
+                f"{n_set_pieces} set {'piece' if n_set_pieces == 1 else 'pieces'}"
+            )
+
+        if event_parts:
+            event_sentence = "Events include: " + ", ".join(event_parts) + "."
+        else:
+            event_sentence = "No tracked events occur in this window."
+    else:
+        # Fallback heuristic: possession change count only
+        changes = analysis.possession_changes
+        if changes == 0:
+            event_sentence = "Possession remains with one team throughout."
+        elif changes == 1:
+            t_str = (
+                f" at approximately {analysis.possession_change_times_s[0]:.1f}s"
+                if analysis.possession_change_times_s
+                else ""
+            )
+            event_sentence = f"One possession change occurs{t_str}."
+        else:
+            event_sentence = f"{changes} possession changes occur."
+
+    # --- Motion intensity sentence ---
+    if motion_intensity:
+        intensity = motion_intensity.get("intensity_label", "medium")
+        intensity_sentence = f"Player movement intensity is {intensity}."
+    else:
+        intensity_sentence = ""
+
+    # ── Chinese tactical layer ──────────────────────────────────────────────
+    team_zh = _team_label_zh(team)
+
+    if time_scale > 1:
+        real_duration = analysis.clip_duration_s
+        time_header_zh = (
+            f"这段{output_dur:.0f}秒的视频以{time_scale}倍速压缩，"
+            f"覆盖了真实比赛中{real_duration:.0f}秒的内容。"
+        )
+    else:
+        time_header_zh = f"在这段{output_dur:.0f}秒的片段中，"
+
+    poss_sentence_zh = f"{team_zh}掌控控球权（占{poss_pct}%的时间）。"
+
+    if zone_trajectory and zone_trajectory.get("time_in_third"):
+        time_in_third = zone_trajectory["time_in_third"]
+        is_traversal = zone_trajectory.get("is_traversal", False)
+        if is_traversal:
+            ball_sentence_zh = "比赛覆盖球场全长，足球贯穿后场、中场和前场三个区域。"
+        else:
+            dominant_third = max(time_in_third, key=time_in_third.get)
+            pct = int(time_in_third[dominant_third] * 100)
+            ball_sentence_zh = f"比赛主要集中在{_third_label_zh(dominant_third)}区域（占{pct}%的时间）。"
+    else:
+        ball_sentence_zh = ""
+
+    if events is not None:
+        home_p = events.get("home_passes", 0)
+        away_p = events.get("away_passes", 0)
+        total_p = events.get("passes", home_p + away_p)
+        n_carries = events.get("carries", 0)
+        n_lost = events.get("ball_lost", 0)
+        n_challenges = events.get("challenges", 0)
+        n_set_pieces = events.get("set_pieces", 0)
+        event_parts_zh: list[str] = []
+        if total_p > 0:
+            if home_p > 0 and away_p > 0:
+                event_parts_zh.append(f"主队{home_p}次传球、客队{away_p}次传球")
+            else:
+                event_parts_zh.append(f"{total_p}次传球")
+        if n_carries > 0:
+            event_parts_zh.append(f"{n_carries}次带球推进")
+        if n_lost > 0:
+            event_parts_zh.append(f"{n_lost}次失球")
+        if n_challenges > 0:
+            event_parts_zh.append(f"{n_challenges}次身体对抗")
+        if n_set_pieces > 0:
+            event_parts_zh.append(f"{n_set_pieces}次定位球")
+        if event_parts_zh:
+            event_sentence_zh = "事件包括：" + "，".join(event_parts_zh) + "。"
+        else:
+            event_sentence_zh = "该时间窗口内无记录事件。"
+    else:
+        changes = analysis.possession_changes
+        if changes == 0:
+            event_sentence_zh = "控球权全程由同一队掌握。"
+        elif changes == 1:
+            t_str = (
+                f"（约{analysis.possession_change_times_s[0]:.1f}秒时）"
+                if analysis.possession_change_times_s else ""
+            )
+            event_sentence_zh = f"发生1次控球权交换{t_str}。"
+        else:
+            event_sentence_zh = f"发生{changes}次控球权交换。"
+
+    if motion_intensity:
+        intensity_zh = _intensity_label_zh(motion_intensity.get("intensity_label", "medium"))
+        intensity_sentence_zh = f"球员运动强度为{intensity_zh}。"
+    else:
+        intensity_sentence_zh = ""
+
+    # ── Assemble English tactical ───────────────────────────────────────────
+    tactical_parts_en = [time_header, poss_sentence]
+    if ball_sentence:
+        tactical_parts_en.append(ball_sentence)
+    tactical_parts_en.append(event_sentence)
+    if intensity_sentence:
+        tactical_parts_en.append(intensity_sentence)
+    tactical_en = " ".join(tactical_parts_en)
+
+    # ── Assemble Chinese tactical ───────────────────────────────────────────
+    tactical_parts_zh = [time_header_zh, poss_sentence_zh]
+    if ball_sentence_zh:
+        tactical_parts_zh.append(ball_sentence_zh)
+    tactical_parts_zh.append(event_sentence_zh)
+    if intensity_sentence_zh:
+        tactical_parts_zh.append(intensity_sentence_zh)
+    tactical_zh = "".join(tactical_parts_zh)
+
+    # ── Combine with visual layer ───────────────────────────────────────────
+    if coords_xy is not None and agent_ids is not None:
+        visual_en, visual_zh = generate_visual_prefix(
+            coords_xy, agent_ids, pitch_length_m, pitch_width_m,
+            agent_types=agent_types, flipped=flipped, zone_trajectory=zone_trajectory,
+        )
+        en_block = f"{visual_en}\n\n{tactical_en}"
+        zh_block = f"{visual_zh}\n\n{tactical_zh}"
+        return f"{en_block}\n\n---\n\n{zh_block}"
+
+    return f"{tactical_en}\n\n---\n\n{tactical_zh}"
+
+
+def _zone_label_zh(zone: str) -> str:
+    """Translate 'third-channel' zone string to Chinese, e.g. 'attacking-right' → '前场右路'."""
+    third_map = {"defensive": "后场", "middle": "中场", "attacking": "前场"}
+    channel_map = {"left": "左路", "central": "中路", "right": "右路"}
+    parts = zone.split("-", 1)
+    third_zh = third_map.get(parts[0], parts[0])
+    channel_zh = channel_map.get(parts[1], parts[1]) if len(parts) > 1 else ""
+    return f"{third_zh}{channel_zh}"
+
+
+def _third_label_zh(third: str) -> str:
+    return {"defensive": "后场", "middle": "中场", "attacking": "前场"}.get(third, third)
+
+
+def _intensity_label_zh(label: str) -> str:
+    return {"low": "低", "medium": "中等", "high": "高"}.get(label, label)
+
+
+def _team_label_zh(team: str) -> str:
+    return {"home": "主队", "away": "客队"}.get(team.lower(), team)
+
+
+def compute_ball_zone_trajectory(
+    ball_xy: np.ndarray,
+    pitch_length_m: float = 105.0,
+    pitch_width_m: float = 68.0,
+) -> dict:
+    """
+    Classify ball position per rendered frame into 9 zones (third × channel).
+    Returns deduped zone sequence, time-in-third fractions, and traversal flag.
+    ball_xy: shape (num_frames, 2), metric meters, rendered frames only.
+    """
+    raw_zones: list[Optional[str]] = []
+    for i in range(len(ball_xy)):
+        x, y = float(ball_xy[i, 0]), float(ball_xy[i, 1])
+        if not (np.isfinite(x) and np.isfinite(y)):
+            raw_zones.append(None)
+            continue
+        third = _get_ball_zone(x, pitch_length_m)
+        channel = _get_ball_channel(y, pitch_width_m)
+        raw_zones.append(f"{third}-{channel}")
+
+    valid_zones = [z for z in raw_zones if z is not None]
+    n_valid = len(valid_zones)
+    if n_valid == 0:
+        return {
+            "zone_sequence": [],
+            "dominant_zone": "middle-central",
+            "time_in_third": {},
+            "is_traversal": False,
+        }
+
+    # Time fraction per third
+    thirds = [z.split("-")[0] for z in valid_zones]
+    thirds_counts: dict[str, int] = {}
+    for t in thirds:
+        thirds_counts[t] = thirds_counts.get(t, 0) + 1
+    time_in_third = {k: v / n_valid for k, v in thirds_counts.items()}
+
+    # Full zone counts for dominant
+    zone_counts: dict[str, int] = {}
+    for z in valid_zones:
+        zone_counts[z] = zone_counts.get(z, 0) + 1
+    dominant_zone = max(zone_counts, key=zone_counts.get)
+
+    # Deduped zone sequence (remove consecutive duplicates)
+    zone_sequence: list[str] = []
+    for z in raw_zones:
+        if z is not None and (not zone_sequence or zone_sequence[-1] != z):
+            zone_sequence.append(z)
+
+    return {
+        "zone_sequence": zone_sequence,
+        "dominant_zone": dominant_zone,
+        "time_in_third": time_in_third,
+        "is_traversal": len(set(thirds)) >= 3,
+    }
+
+
+def compute_motion_intensity(
+    coords_xy: np.ndarray,
+    agent_types: np.ndarray,
+    fps: int,
+) -> dict:
+    """
+    Compute mean outfield player speed from frame-to-frame position deltas.
+    coords_xy: shape (num_frames, num_agents, 2), rendered frames only.
+    Returns intensity_label: 'low' (<2 m/s), 'medium' (2-4 m/s), 'high' (>4 m/s).
+    """
+    outfield_mask = np.array([a != AgentType.BALL for a in agent_types], dtype=bool)
+    outfield_xy = coords_xy[:, outfield_mask, :]  # (frames, n_outfield, 2)
+
+    if outfield_xy.shape[0] < 2 or outfield_xy.shape[1] == 0:
+        return {"mean_player_speed_ms": 0.0, "intensity_label": "low"}
+
+    deltas = np.diff(outfield_xy, axis=0)  # (frames-1, n_outfield, 2)
+    distances = np.sqrt(deltas[..., 0] ** 2 + deltas[..., 1] ** 2)  # (frames-1, n_outfield)
+    speeds_ms = distances * fps  # convert per-frame distance to m/s
+
+    valid = np.isfinite(speeds_ms)
+    if not valid.any():
+        return {"mean_player_speed_ms": 0.0, "intensity_label": "low"}
+
+    mean_speed = float(np.nanmean(speeds_ms[valid]))
+    if mean_speed < 2.0:
+        label = "low"
+    elif mean_speed < 4.0:
+        label = "medium"
+    else:
+        label = "high"
+
+    return {"mean_player_speed_ms": mean_speed, "intensity_label": label}
+
+
+def load_events_for_clip(
+    events_df: "pd.DataFrame",
+    start_frame: int,
+    end_frame: int,
+) -> dict:
+    """
+    Filter a Metrica events DataFrame to events whose Start Frame falls within
+    [start_frame, end_frame) and return per-type counts.
+    """
+    mask = (events_df["Start Frame"] >= start_frame) & (events_df["Start Frame"] < end_frame)
+    clip_ev = events_df[mask].copy()
+
+    if clip_ev.empty:
+        return {
+            "passes": 0, "carries": 0, "ball_lost": 0, "challenges": 0,
+            "set_pieces": 0, "ball_out": 0, "home_passes": 0, "away_passes": 0,
+        }
+
+    clip_ev["_type_upper"] = clip_ev["Type"].str.strip().str.upper()
+    clip_ev["_team_norm"] = clip_ev["Team"].apply(lambda v: _normalize_team_label(str(v)))
+
+    def _count(t: str) -> int:
+        return int((clip_ev["_type_upper"] == t).sum())
+
+    passes_df = clip_ev[clip_ev["_type_upper"] == "PASS"]
+    home_passes = int((passes_df["_team_norm"] == "home").sum())
+    away_passes = int((passes_df["_team_norm"] == "away").sum())
+
+    return {
+        "passes": _count("PASS"),
+        "carries": _count("CARRY"),
+        "ball_lost": _count("BALL LOST"),
+        "challenges": _count("CHALLENGE"),
+        "set_pieces": _count("SET PIECE"),
+        "ball_out": _count("BALL OUT"),
+        "home_passes": home_passes,
+        "away_passes": away_passes,
+    }
 
 
 def export_prompt_txt(prompt: str, output_dir: str | Path) -> None:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+
+
+def export_wan_sidecar(prompt: str, output_dir: str | Path, clip_name: str) -> None:
+    """Export Wan2.1/2.2 compatible sidecar .txt file (same name as ground_truth.mp4)."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{clip_name}.txt").write_text(prompt, encoding="utf-8")
 
 
 class DataParser(ABC):
@@ -897,16 +1373,26 @@ class MetricaAdapter(BaseTrackingAdapter):
         away_csv_path: str | Path,
         pitch_length_m: float = 105.0,
         pitch_width_m: float = 68.0,
+        events_csv_path: Optional[str | Path] = None,
     ) -> None:
         super().__init__(pitch_length_m=pitch_length_m, pitch_width_m=pitch_width_m)
         self.home_csv_path = Path(home_csv_path)
         self.away_csv_path = Path(away_csv_path)
+        self.events_csv_path: Optional[Path] = Path(events_csv_path) if events_csv_path else None
+        self.events_df: Optional[pd.DataFrame] = None
 
     @classmethod
     def required_input_names(cls) -> tuple[str, ...]:
         return ("home_csv", "away_csv")
 
     def load_canonical(self) -> CanonicalTrackingSource:
+        if self.events_csv_path is not None:
+            if not self.events_csv_path.exists():
+                raise FileNotFoundError(
+                    f"Metrica events file not found: {self.events_csv_path}"
+                )
+            self.events_df = pd.read_csv(self.events_csv_path)
+
         home_df = self._read_metrica_csv(self.home_csv_path)
         away_df = self._read_metrica_csv(self.away_csv_path)
 
@@ -1630,6 +2116,11 @@ class AdapterBackedParser(DataParser):
         self._source_match_id: Optional[str] = None
         self._schema_version: Optional[str] = None
 
+    @property
+    def events_df(self) -> Optional[pd.DataFrame]:
+        """Return events DataFrame from adapter if available (Metrica only)."""
+        return getattr(self.adapter, "events_df", None)
+
     def load(self) -> None:
         canonical = self.adapter.load_canonical()
         self._source_dataset = canonical.source_dataset
@@ -1649,6 +2140,7 @@ class MetricaParser(AdapterBackedParser):
         away_csv_path: str | Path,
         pitch_length_m: float = 105.0,
         pitch_width_m: float = 68.0,
+        events_csv_path: Optional[str | Path] = None,
     ) -> None:
         super().__init__(
             MetricaAdapter(
@@ -1656,6 +2148,7 @@ class MetricaParser(AdapterBackedParser):
                 away_csv_path=away_csv_path,
                 pitch_length_m=pitch_length_m,
                 pitch_width_m=pitch_width_m,
+                events_csv_path=events_csv_path,
             )
         )
 
@@ -1712,8 +2205,8 @@ class BEVRenderer:
 
     def __init__(
         self,
-        width: int = 800,
-        height: int = 520,
+        width: int = 832,
+        height: int = 480,
         home_color: str = "#E63946",
         away_color: str = "#457B9D",
         ball_color: str = "#F5F500",
@@ -2024,6 +2517,7 @@ def _build_metrica_parser(args: argparse.Namespace) -> DataParser:
         away_csv_path=args.away_csv,
         pitch_length_m=args.pitch_length_m,
         pitch_width_m=args.pitch_width_m,
+        events_csv_path=getattr(args, "events_csv", None),
     )
 
 
@@ -2106,6 +2600,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--home_csv", type=str, default=None, help="Metrica home CSV path.")
     parser.add_argument("--away_csv", type=str, default=None, help="Metrica away CSV path.")
     parser.add_argument(
+        "--events_csv", type=str, default=None,
+        help="Optional Metrica events CSV path (e.g. Sample_Game_2_RawEventsData.csv). "
+             "When provided, prompt generation uses ground-truth event labels (passes, carries, etc.) "
+             "instead of heuristic inference.",
+    )
+    parser.add_argument(
         "--tracking_json",
         type=str,
         default=None,
@@ -2123,15 +2623,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clip_id_prefix", type=str, default="soccer_bev")
     parser.add_argument("--num_clips", type=int, default=1)
     parser.add_argument("--clip_index_offset", type=int, default=0)
-    parser.add_argument("--fps", type=int, default=25)
-    parser.add_argument("--seconds", type=int, default=10)
+    parser.add_argument("--fps", type=int, default=16)
+    parser.add_argument("--seconds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--start_frame", type=int, default=None)
     parser.add_argument("--max_sampling_attempts", type=int, default=100)
     parser.add_argument("--allow_duplicate_starts", action="store_true")
 
-    parser.add_argument("--width", type=int, default=800)
-    parser.add_argument("--height", type=int, default=520)
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--pitch_length_m", type=float, default=105.0)
     parser.add_argument("--pitch_width_m", type=float, default=68.0)
     parser.add_argument("--home_color", type=str, default="#E63946")
@@ -2147,6 +2647,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min_defense_ahead_ratio", type=float, default=0.0)
     parser.add_argument("--min_majority_possession_ratio", type=float, default=0.50)
 
+    parser.add_argument(
+        "--time_scale", type=int, default=1,
+        help="Temporal compression factor. time_scale=10 consumes 10x raw tracking frames "
+             "and renders every 10th, producing the same output length but covering 10x real game time.",
+    )
+
     return parser
 
 
@@ -2156,8 +2662,18 @@ def main() -> None:
     clip_frames = int(args.fps * args.seconds)
     if clip_frames <= 0:
         raise ValueError("fps * seconds must be > 0.")
+    if (clip_frames - 1) % 4 != 0:
+        remainder = (clip_frames - 1) % 4
+        clip_frames = clip_frames + (4 - remainder)
+        print(
+            f"[warn] clip_frames adjusted to {clip_frames} to satisfy Wan2.1/2.2 N×4+1 constraint "
+            f"(fps={args.fps}, seconds={args.seconds} → {int(args.fps * args.seconds)} → {clip_frames})"
+        )
     if args.max_sampling_attempts <= 0:
         raise ValueError("--max_sampling_attempts must be > 0.")
+    if args.time_scale < 1:
+        raise ValueError("--time_scale must be >= 1.")
+    raw_frames = clip_frames * args.time_scale
 
     data_parser = _create_dataset_parser(dataset_name, args)
     data_parser.load()
@@ -2172,7 +2688,7 @@ def main() -> None:
     )
     sampled_specs = sample_clip_specs(
         parser=data_parser,
-        num_frames=clip_frames,
+        num_frames=raw_frames,
         fps=args.fps,
         num_clips=args.num_clips,
         global_seed=args.seed,
@@ -2193,12 +2709,48 @@ def main() -> None:
     normalize_orientation = not args.disable_orientation_normalization
 
     for idx, spec in enumerate(sampled_specs):
-        clip = data_parser.parse_clip(start_frame=spec.start_frame, num_frames=clip_frames, fps=args.fps)
-        frames = renderer.render_frames(clip, normalize_orientation=normalize_orientation)
+        clip = data_parser.parse_clip(start_frame=spec.start_frame, num_frames=raw_frames, fps=args.fps)
 
-        norm_coords, _, _ = normalize_attack_direction(clip.coords_xy, clip)
+        norm_coords, flipped, _ = normalize_attack_direction(clip.coords_xy, clip)
         analysis = analyze_clip_events(clip, norm_coords)
-        prompt_text = generate_clip_prompt(analysis)
+
+        render_clip = stride_clip(clip, args.time_scale)
+        render_norm_coords = norm_coords[::args.time_scale]
+        frames = renderer.render_frames(render_clip, normalize_orientation=normalize_orientation)
+
+        # Compute grounded prompt metrics from rendered (strided) coordinates
+        ball_idx_in_agents = next(
+            (i for i, a in enumerate(clip.agent_types) if a == AgentType.BALL), None
+        )
+        zone_traj = None
+        if ball_idx_in_agents is not None:
+            zone_traj = compute_ball_zone_trajectory(
+                render_norm_coords[:, ball_idx_in_agents, :],
+                data_parser.pitch_length_m,
+                data_parser.pitch_width_m,
+            )
+        motion = compute_motion_intensity(render_norm_coords, clip.agent_types, clip.fps)
+
+        _events_df = getattr(data_parser, "events_df", None)
+        clip_events = (
+            load_events_for_clip(_events_df, spec.start_frame, spec.start_frame + raw_frames)
+            if _events_df is not None
+            else None
+        )
+
+        prompt_text = generate_clip_prompt(
+            analysis,
+            coords_xy=render_norm_coords,
+            agent_ids=clip.agent_ids,
+            pitch_length_m=data_parser.pitch_length_m,
+            pitch_width_m=data_parser.pitch_width_m,
+            time_scale=args.time_scale,
+            agent_types=clip.agent_types,
+            flipped=flipped,
+            zone_trajectory=zone_traj,
+            motion_intensity=motion,
+            events=clip_events,
+        )
 
         if args.num_clips == 1:
             clip_id = args.clip_id
@@ -2208,6 +2760,7 @@ def main() -> None:
         out_dir = Path(args.output_root) / clip_id
         export_vbvr_clip(frames, out_dir, fps=args.fps)
         export_prompt_txt(prompt_text, out_dir)
+        export_wan_sidecar(prompt_text, out_dir, "ground_truth")
 
         print(
             f"[{idx + 1}/{len(sampled_specs)}] Export complete: dataset={dataset_name}, "

@@ -2,6 +2,25 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## TOP PRIORITY — Subagent & Parallelism Strategy
+
+**核心原则：每一步都尽可能使用最多数量的 subagents 并行工作，数量不设上限（as many as needed）。宁可多开不要少开。**
+
+Before starting **any** task:
+1. **More than 3 lines of code to change?** → Delegate to subagents.
+2. **Web research needed?** → Launch research subagent in parallel.
+3. **Independent subtasks visible?** → Run as parallel subagents in a single message.
+
+### Maximize Parallelism
+- 拆分粒度尽可能小：每个独立文件、每个独立组件 = 独立 subagent
+- 研究与实现并行；测试与文档并行
+- **永远不要因为 subagent 太多而合并任务**
+
+### Context Passing Rules
+Every subagent prompt **must** include: file paths + line numbers, current state, exact scope, expected output format.
+
+---
+
 ## Project Goal
 Build a reliable data pipeline that transforms soccer tracking streams into VBVR-aligned BEV clip artifacts for large-scale dataset generation.
 
@@ -28,12 +47,12 @@ python soccer_bev_pipeline.py \
   --dataset metrica \
   --home_csv sample_data/metrica_official/data/Sample_Game_2/Sample_Game_2_RawTrackingData_Home_Team.csv \
   --away_csv sample_data/metrica_official/data/Sample_Game_2/Sample_Game_2_RawTrackingData_Away_Team.csv \
-  --start_frame 1 --disable_realism_filter
+  --start_frame 1 --disable_realism_filter --fps 16 --seconds 5
 ```
 
 **Batched deterministic generation:**
 ```bash
-python soccer_bev_pipeline.py --dataset <name> --num_clips N --seed S
+python soccer_bev_pipeline.py --dataset <name> --num_clips N --seed S --fps 16 --seconds 5
 ```
 
 **EC2-to-S3 batch runner:**
@@ -95,8 +114,8 @@ Raw data → Adapter (canonical long_df) → Parser (densify/interpolate/normali
 | `--start_frame` | None | Pin start frame (skips sampler) |
 | `--disable_realism_filter` | off | Bypass all realism gates |
 | `--allow_duplicate_starts` | off | Allow repeated clip windows |
-| `--fps` | 25 | Output video FPS |
-| `--seconds` | 10 | Clip duration |
+| `--fps` | 16 | Output video FPS (Wan2.1 native FPS) |
+| `--seconds` | 5 | Clip duration (81 frames = N×4+1 constraint for Wan2.1) |
 
 ## Engineering Priorities
 1. Determinism at scale (seeded sampling and shard-safe indexing)
